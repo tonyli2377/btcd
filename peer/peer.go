@@ -2171,10 +2171,10 @@ func newPeerBase(origCfg *Config, inbound bool) *Peer {
 	}
 
 	p := Peer{
-		inbound:         inbound,
+		inbound:         inbound, //用于指示Peer是inbound还是outbound。如果当前节点主动连接Peer，则Peer为OutbandPeer；如果Peer主动连接当前节点，则Peer为InboundPeer;
 		wireEncoding:    wire.BaseEncoding,
-		knownInventory:  newMruInventoryMap(maxKnownInventory),
-		stallControl:    make(chan stallControlMsg, 1), // nonblocking sync
+		knownInventory:  newMruInventoryMap(maxKnownInventory), // 已经发送给Peer的Inventory的缓存
+		stallControl:    make(chan stallControlMsg, 1),         // nonblocking sync
 		outputQueue:     make(chan outMsg, outputBufferSize),
 		sendQueue:       make(chan outMsg, 1),   // nonblocking sync
 		sendDoneQueue:   make(chan struct{}, 1), // nonblocking sync

@@ -333,6 +333,7 @@ out:
 				}
 
 			case handleFailed:
+				/*LL
 				connReq := msg.c
 
 				if _, ok := pending[connReq.id]; !ok {
@@ -342,9 +343,10 @@ out:
 				}
 
 				connReq.updateState(ConnFailing)
-				log.Debugf("Failed to connect to %v: %v",
+				log.Debugf("**Failed to connect to %v: %v",
 					connReq, msg.err)
 				cm.handleFailedConn(connReq)
+				*/
 			}
 
 		case <-cm.quit:

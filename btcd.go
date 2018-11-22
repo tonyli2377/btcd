@@ -7,6 +7,9 @@ package main
 
 import (
 	"fmt"
+	"github.com/btcsuite/btcd/blockchain/indexers"
+	"github.com/btcsuite/btcd/database"
+	"github.com/btcsuite/btcd/limits"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -15,10 +18,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"runtime/pprof"
-
-	"github.com/btcsuite/btcd/blockchain/indexers"
-	"github.com/btcsuite/btcd/database"
-	"github.com/btcsuite/btcd/limits"
 )
 
 const (

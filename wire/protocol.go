@@ -145,6 +145,10 @@ type BitcoinNet uint32
 // used to seek to the next message when a stream's state is unknown, but
 // this package does not provide that functionality since it's generally a
 // better idea to simply disconnect clients that are misbehaving over TCP.
+//LL, Magic numbers are used in computer science for both files and protocols. They identify the type of the file/data structure.
+// A program receiving such a file/data structure can check the magic number and immediately know the supposed type of that file/data structure.
+// Protocols like bitcoin use data structures to talk to each other (e.g. propagating blocks through the network).
+// Nodes check the first bytes to identify the type of data structure.
 const (
 	// MainNet represents the main bitcoin network.
 	MainNet BitcoinNet = 0xd9b4bef9
