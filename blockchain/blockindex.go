@@ -1,6 +1,7 @@
 // Copyright (c) 2015-2017 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 实现了blockIndex，用于维护blockchain上block与其hash之间的映射关系和父block与子block(s)的关系
 
 package blockchain
 

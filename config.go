@@ -978,8 +978,10 @@ func loadConfig() (*config, []string, error) {
 	// proxy is specified, the dial function is set to the proxy specific
 	// dial function and the lookup is set to use tor (unless --noonion is
 	// specified in which case the system DNS resolver is used).
+	// 默认的DNS Lookup和Dial方法就是标准的net.LookupIP和net.DialTimeout
 	cfg.dial = net.DialTimeout
 	cfg.lookup = net.LookupIP
+	//如果设置了代理，Dial方法将使用SOCKS Proxy的DialTimeout()
 	if cfg.Proxy != "" {
 		_, _, err := net.SplitHostPort(cfg.Proxy)
 		if err != nil {
@@ -993,6 +995,7 @@ func loadConfig() (*config, []string, error) {
 		// Tor isolation flag means proxy credentials will be overridden
 		// unless there is also an onion proxy configured in which case
 		// that one will be overridden.
+		// 如果未禁用洋葱代理，则默认代理为洋葱代理，DNS查询将通过connmgr的TorLookupIP()实现
 		torIsolation := false
 		if cfg.TorIsolation && cfg.OnionProxy == "" &&
 			(cfg.ProxyUser != "" || cfg.ProxyPass != "") {

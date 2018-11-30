@@ -844,8 +844,6 @@ mempoolLoop:
 	// the last several blocks per the chain consensus rules.
 	ts := medianAdjustedTime(best, g.timeSource)
 	reqDifficulty, err := g.chain.CalcNextRequiredDifficulty(ts)
-	//LL,
-	reqDifficulty = 521142271
 	if err != nil {
 		return nil, err
 	}

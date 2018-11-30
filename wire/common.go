@@ -1,6 +1,7 @@
 // Copyright (c) 2013-2016 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 定义了向二进制流读写基础数据类型的的方法，同时也定义了读写可变长度整数值和可变长度字符串的方法
 
 package wire
 

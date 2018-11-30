@@ -2,6 +2,8 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// 定义了KnownAddress类型，即地址仓库中每条地址记录的格式
+
 package addrmgr
 
 import (
@@ -13,13 +15,13 @@ import (
 // KnownAddress tracks information about a known network address that is used
 // to determine how viable an address is.
 type KnownAddress struct {
-	na          *wire.NetAddress
-	srcAddr     *wire.NetAddress
-	attempts    int
-	lastattempt time.Time
-	lastsuccess time.Time
-	tried       bool
-	refs        int // reference count of new buckets
+	na          *wire.NetAddress //从addr消息获知的节点的IPv4或者IPv6地址，请注意，我们看到KnownAddress序列化后，在peers.json中有“.onion”的地址，它是由特定的支持Tor的IPv6地址转换而来
+	srcAddr     *wire.NetAddress //addr消息的源，也是当前节点
+	attempts    int              //连接成功之前尝试连接的次数
+	lastattempt time.Time        //最近一次尝试连接的时间点
+	lastsuccess time.Time        //最近一次尝试连接成功的时间点
+	tried       bool             //标识是否已经尝试连接过，已经tried过的地址将被放入TriedBuckets
+	refs        int              // reference count of new buckets 该地址所属的NewBucket的个数，默认最大个数是8
 }
 
 // NetAddress returns the underlying wire.NetAddress associated with the

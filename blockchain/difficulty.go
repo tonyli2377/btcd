@@ -1,6 +1,7 @@
 // Copyright (c) 2013-2017 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 提供了与区块难度值相关的方法，如区块头里的难度值与整数值之间的转换、通过难度值计算工作量和难度值调整算法等等
 
 package blockchain
 
@@ -8,6 +9,7 @@ import (
 	"math/big"
 	"time"
 
+	"fmt"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 )
 
@@ -60,9 +62,12 @@ func HashToBig(hash *chainhash.Hash) *big.Int {
 // sign bit, but it is implemented here to stay consistent with bitcoind.
 func CompactToBig(compact uint32) *big.Int {
 	// Extract the mantissa, sign bit, and exponent.
+	fmt.Printf("compact:%d \n", compact)
 	mantissa := compact & 0x007fffff
+	fmt.Printf("compact:%d \n", mantissa)
 	isNegative := compact&0x00800000 != 0
 	exponent := uint(compact >> 24)
+	fmt.Printf("exponent:%d \n", exponent)
 
 	// Since the base for the exponent is 256, the exponent can be treated
 	// as the number of bytes to represent the full 256-bit number.  So,
@@ -75,6 +80,9 @@ func CompactToBig(compact uint32) *big.Int {
 		bn = big.NewInt(int64(mantissa))
 	} else {
 		bn = big.NewInt(int64(mantissa))
+		//bn = bn * 256^(exponent-3)
+		// 2的8次方是256，所以 bn = bn * 2^8*(exponent-3)，即bn左移8*(exponent-3)位
+		//左移一位就是乘2，右移一位就是除2
 		bn.Lsh(bn, 8*(exponent-3))
 	}
 
@@ -83,6 +91,7 @@ func CompactToBig(compact uint32) *big.Int {
 		bn = bn.Neg(bn)
 	}
 
+	fmt.Printf("0x%064x\n", bn)
 	return bn
 }
 

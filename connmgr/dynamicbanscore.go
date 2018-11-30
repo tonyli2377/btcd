@@ -1,6 +1,7 @@
 // Copyright (c) 2016 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 用于防止DDoS攻击的动态计分器
 
 package connmgr
 
@@ -41,6 +42,8 @@ func init() {
 
 // decayFactor returns the decay factor at t seconds, using precalculated values
 // if available, or calculating the factor if needed.
+// 衰减系数是按时间间隔呈指数分布
+// 这里的时间间隔是指当前取值时刻距上一次主动调节persistent或者transistent值的时间差
 func decayFactor(t int64) float64 {
 	if t < precomputedLen {
 		return precomputedFactor[t]
@@ -60,11 +63,12 @@ func decayFactor(t int64) float64 {
 //
 // Zero value: Values of type DynamicBanScore are immediately ready for use upon
 // declaration.
+// DynamicBanScore提供的分值是由一个不变值和瞬时值构成的
 type DynamicBanScore struct {
-	lastUnix   int64
-	transient  float64
-	persistent uint32
-	mtx        sync.Mutex
+	lastUnix   int64      //上一次调整分值的Unix时间点
+	transient  float64    //分值的浮动衰减部分
+	persistent uint32     //分值中不会自动衰减的部分
+	mtx        sync.Mutex //保护transient和persistent的互斥锁
 }
 
 // String returns the ban score as a human-readable string.
@@ -114,6 +118,7 @@ func (s *DynamicBanScore) Reset() {
 //
 // This function is not safe for concurrent access. It is intended to be used
 // internally and during testing.
+// DynamicBanScore最后的分值等于persistent加上transient乘以一个衰减系数后的和。其中衰减系数随时间变化，它由decayFactor()决定
 func (s *DynamicBanScore) int(t time.Time) uint32 {
 	dt := t.Unix() - s.lastUnix
 	if s.transient < 1 || dt < 0 || Lifetime < dt {
@@ -128,6 +133,10 @@ func (s *DynamicBanScore) int(t time.Time) uint32 {
 // resulting score is returned.
 //
 // This function is not safe for concurrent access.
+// 主动调节score值时，先将persistent值直接相加，然后算出传入时刻t的transient值，再与传入的transient值相加后得到新的transient值，
+// 新的persistent与新的transient值相加后得到新的score。实际上，就是t时刻的score加上传入的persistent和transient即得到新的score。
+// Peer之间交换消息时，每一个Peer连接会有一个动态计分器来监控它们之间收发消息的频率，
+// 太频繁地收到某个Peer发过来的消息时，将被怀疑遭到DDoS攻击，从而主动断开与它的连接
 func (s *DynamicBanScore) increase(persistent, transient uint32, t time.Time) uint32 {
 	s.persistent += persistent
 	tu := t.Unix()
@@ -137,10 +146,10 @@ func (s *DynamicBanScore) increase(persistent, transient uint32, t time.Time) ui
 		if Lifetime < dt {
 			s.transient = 0
 		} else if s.transient > 1 && dt > 0 {
-			s.transient *= decayFactor(dt)
+			s.transient *= decayFactor(dt) //算出传入时刻t的transient值
 		}
-		s.transient += float64(transient)
+		s.transient += float64(transient) //与传入的transient值相加后得到新的transient值
 		s.lastUnix = tu
 	}
-	return s.persistent + uint32(s.transient)
+	return s.persistent + uint32(s.transient) //新的persistent与新的transient值相加后得到新的score
 }

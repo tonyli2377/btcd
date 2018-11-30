@@ -31,9 +31,9 @@ const MaxBlockLocatorsPerMsg = 500
 // exponentially decrease the number of hashes the further away from head and
 // closer to the genesis block you get.
 type MsgGetBlocks struct {
-	ProtocolVersion    uint32
-	BlockLocatorHashes []*chainhash.Hash
-	HashStop           chainhash.Hash
+	ProtocolVersion    uint32            //协议的版本号
+	BlockLocatorHashes []*chainhash.Hash //记录一个BlockLocator，BlockLocator用于定位列表中第一个block元素在区块链中的位置
+	HashStop           chainhash.Hash    //getblocks请求的block区间的结束位置
 }
 
 // AddBlockLocatorHash adds a new block locator hash to the message.
@@ -93,18 +93,18 @@ func (msg *MsgGetBlocks) BtcEncode(w io.Writer, pver uint32, enc MessageEncoding
 		return messageError("MsgGetBlocks.BtcEncode", str)
 	}
 
-	err := writeElement(w, msg.ProtocolVersion)
+	err := writeElement(w, msg.ProtocolVersion) //写入协议版本号
 	if err != nil {
 		return err
 	}
 
-	err = WriteVarInt(w, pver, uint64(count))
+	err = WriteVarInt(w, pver, uint64(count)) //写入BlockLocator中hash个数
 	if err != nil {
 		return err
 	}
 
 	for _, hash := range msg.BlockLocatorHashes {
-		err = writeElement(w, hash)
+		err = writeElement(w, hash) //写入BlockLocator中hash列表
 		if err != nil {
 			return err
 		}
@@ -130,6 +130,8 @@ func (msg *MsgGetBlocks) MaxPayloadLength(pver uint32) uint32 {
 // NewMsgGetBlocks returns a new bitcoin getblocks message that conforms to the
 // Message interface using the passed parameters and defaults for the remaining
 // fields.
+// getblocks请求的区块位于BlockLocator指向的区块和HashStop指向的区块之间，不包括BlockLocator指向的区块；
+// 如果HashStop为零，则返回BlockLocator指向的区块之后的500个区块
 func NewMsgGetBlocks(hashStop *chainhash.Hash) *MsgGetBlocks {
 	return &MsgGetBlocks{
 		ProtocolVersion:    ProtocolVersion,

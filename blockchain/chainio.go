@@ -1,6 +1,7 @@
 // Copyright (c) 2015-2017 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 提供了向db中读写区块或者相关元数据(如ThresholdCaches、BlockIndex等等)的方法
 
 package blockchain
 

@@ -1,6 +1,8 @@
 // Copyright (c) 2016-2017 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 实现了BIP9中描述的关于区块版本号的定义，区块版本号是一个32位且按小端模式存储的整型值，以001开头，其后的每一位代表一个BIP部署；
+// 同时也实现了根据部署状态确定下一个区块的目标版本号的方法，用于设定新“挖”出区块的版本号，我们将在后文中详细分析
 
 package blockchain
 

@@ -1,6 +1,7 @@
 // Copyright (c) 2016 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 包含自动生成测试用例的实现类，用于测试区块的共识参数
 
 /*
 Package fullblocktests provides a set of block consensus validation tests.

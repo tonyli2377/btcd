@@ -40,14 +40,18 @@ type MsgVersion struct {
 	AddrYou NetAddress
 
 	// Address of the local peer.
+	// 在较新版本(Satoshi:0.14.1及以上)Bitcoin客户端实现中，AddrMe不再包含本地的IP和Port，因为节点可能通过Proxy上网，填入本地的地址没有意义
 	AddrMe NetAddress
 
 	// Unique value associated with message that is used to detect self
 	// connections.
+	// Nonce是为了防止自己给自己发送version消息
 	Nonce uint64
 
 	// The user agent that generated messsage.  This is a encoded as a varString
 	// on the wire.  This has a max length of MaxUserAgentLen.
+	// UserAgent会被编码为可变长度字符串，它可以用来区别不同的客户端实现；当前默认的UserAgent是"/btcwire:0.5.0/"，
+	// 可以通过AddUserAgent()方法来附加，如当前btcd实现的UserAgent为“/btcwire:0.5.0/0.12.0”
 	UserAgent string
 
 	// Last block seen by the generator of the version message.

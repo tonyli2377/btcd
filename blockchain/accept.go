@@ -1,6 +1,7 @@
 // Copyright (c) 2013-2017 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// maybeAcceptBlock()方法所在的文件，它是区块被链接到区块链上的入口方法
 
 package blockchain
 

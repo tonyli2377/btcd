@@ -179,7 +179,7 @@ var scriptPool scriptFreeList = make(chan []byte, freeListMaxItems)
 // transaction outputs.
 type OutPoint struct {
 	Hash  chainhash.Hash
-	Index uint32
+	Index uint32 // Index表示上一个交易的输出的序号(因为上一个交易的输出UTXO可能有多个，序号从0开始)
 }
 
 // NewOutPoint returns a new bitcoin transaction outpoint point with the
@@ -208,10 +208,10 @@ func (o OutPoint) String() string {
 
 // TxIn defines a bitcoin transaction input.
 type TxIn struct {
-	PreviousOutPoint OutPoint
-	SignatureScript  []byte
+	PreviousOutPoint OutPoint //上一个交易，包含hash值和Index
+	SignatureScript  []byte   //解锁脚本
 	Witness          TxWitness
-	Sequence         uint32
+	Sequence         uint32 //表示输入交易的序号，对于同一个交易，“矿工”优先选择Sequence更大的交易加入区块进行挖矿，但如果其值为0xffffffff，则表明该交易可以被加进任何区块
 }
 
 // SerializeSize returns the number of bytes it would take to serialize the
@@ -259,7 +259,7 @@ func (t TxWitness) SerializeSize() int {
 
 // TxOut defines a bitcoin transaction output.
 type TxOut struct {
-	Value    int64
+	Value    int64 //Bitcoin数量，这里Value的单位是“聪”，即千万分之一比特币
 	PkScript []byte
 }
 
@@ -287,9 +287,13 @@ func NewTxOut(value int64, pkScript []byte) *TxOut {
 // Use the AddTxIn and AddTxOut functions to build up the list of transaction
 // inputs and outputs.
 type MsgTx struct {
-	Version  int32
-	TxIn     []*TxIn
-	TxOut    []*TxOut
+	Version int32    //Tx的版本号，当前版本号为1；高版本的Tx对LockTime或TxIn中的Sequence的使用不一样
+	TxIn    []*TxIn  //引用的输入交易的UTXO(s)，包含上一个交易的hash值和Index,解锁脚本(SignatureScript),输入交易的序号(Sequence)
+	TxOut   []*TxOut //当前交易的输出UTXO(s)，它包含锁定脚本和输出的Bitcoin数量
+	//既可以表示UTC时间，也可以表示区块高度。当其值小于 5x 10^8 (Tue Nov 5 00:53:20 1985 UTC) 时，它表示区块高度。
+	// 交易只能被打包进大于该高度值或者在该时间点后的区块中。如果其值为0，表明该交易可以加入任何区块中。
+	// 版本2及以上的交易结构引入了相对锁定时间(RLT, relative lock-time)的概念，
+	// 联合LockTime和TxIn的Sequence字段来控制“矿工”节点能否将一个交易打包到某个区块中，详细说明可以参见BIP0068
 	LockTime uint32
 }
 
@@ -304,6 +308,8 @@ func (msg *MsgTx) AddTxOut(to *TxOut) {
 }
 
 // TxHash generates the Hash for the transaction.
+// 交易的Hash是整个交易结构的字节流进行两次SHA256()后的结果。其中，SerializeNoWitness()方法就是调用BtcEncode()对MsgTx进行序列化。
+// BtcEncode()或BtcDecode()就是按MsgTx的定义逐元素写或者读
 func (msg *MsgTx) TxHash() chainhash.Hash {
 	// Encode the transaction and calculate double sha256 on the result.
 	// Ignore the error returns since the only way the encode could fail

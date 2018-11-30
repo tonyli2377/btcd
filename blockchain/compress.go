@@ -1,6 +1,8 @@
 // Copyright (c) 2015-2016 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 实现了一种改进的VLQ(Variable Length Quantity)正整数编码方式，
+// 同时实现了对交易输出额进行压缩编码和输出脚本(锁定脚本)进行压缩编码的算法，进而实现了对交易输出TxOut的压缩;
 
 package blockchain
 

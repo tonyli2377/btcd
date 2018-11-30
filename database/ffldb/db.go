@@ -636,6 +636,7 @@ func (b *bucket) CreateBucket(key []byte) (database.Bucket, error) {
 	}
 
 	// Ensure bucket does not already exist.
+	// 创建子Bucket的Key
 	bidxKey := bucketIndexKey(b.id, key)
 	if b.tx.hasKey(bidxKey) {
 		str := "bucket already exists"
@@ -953,28 +954,34 @@ type pendingBlock struct {
 // read-write and implements the database.Bucket interface.  The transaction
 // provides a root bucket against which all read and writes occur.
 type transaction struct {
-	managed        bool             // Is the transaction managed?
-	closed         bool             // Is the transaction closed?
-	writable       bool             // Is the transaction writable?
-	db             *db              // DB instance the tx was created from.
+	managed  bool // Is the transaction managed?  transaction是否被db托管，托管状态的transaction不能再主动调用Commit()或者Rollback()
+	closed   bool // Is the transaction closed? 当前transaction是否已经结束
+	writable bool // Is the transaction writable?  当前transaction是否可写
+	db       *db  // DB instance the tx was created from. 指向与当前transaction绑定的db对象
+
+	// 当前transaction读到的元数据缓存的一个快照，在transaction打开的时候对dbCache进行快照得到的，
+	// 也是元数据存储中MVCC机制的一部分，类似于BoltDB中读meta page
 	snapshot       *dbCacheSnapshot // Underlying snapshot for txns.
-	metaBucket     *bucket          // The root metadata bucket.
-	blockIdxBucket *bucket          // The block index bucket.
+	metaBucket     *bucket          // The root metadata bucket. 存储元数据的根Bucket
+	blockIdxBucket *bucket          // The block index bucket. 存储区块hash与其序号的Bucket，它是metaBucket的第一个子Bucket，且只在ffldb内部使用;
 
 	// Blocks that need to be stored on commit.  The pendingBlocks map is
 	// kept to allow quick lookups of pending data by block hash.
-	pendingBlocks    map[chainhash.Hash]int
-	pendingBlockData []pendingBlock
+	pendingBlocks    map[chainhash.Hash]int //记录待提交Block的哈希与其在pendingBlockData中的位置的对应关系
+	pendingBlockData []pendingBlock         //顺序记录所有待提交Block的字节序列
 
 	// Keys that need to be stored or deleted on commit.
-	pendingKeys   *treap.Mutable
-	pendingRemove *treap.Mutable
+	pendingKeys   *treap.Mutable //待添加或者更新的元数据集合，它指向一个树堆,通过dbCache向leveldb中更新
+	pendingRemove *treap.Mutable //待删除的元数据集合，指向一个树堆,通过dbCache向leveldb中更新
 
 	// Active iterators that need to be notified when the pending keys have
 	// been updated so the cursors can properly handle updates to the
 	// transaction state.
-	activeIterLock sync.RWMutex
-	activeIters    []*treap.Iterator
+	activeIterLock sync.RWMutex //对activeIters的保护锁
+
+	//用于记录当前transaction中查找dbCache的Iterators，当向dbCache中更新Key时，
+	// 树堆旋转会更新节点间关系，故需将所有活跃的Iterator复位
+	activeIters []*treap.Iterator
 }
 
 // Enforce transaction implements the database.Tx interface.
@@ -1727,11 +1734,11 @@ func (tx *transaction) Rollback() error {
 // the database.DB interface.  All database access is performed through
 // transactions which are obtained through the specific Namespace.
 type db struct {
-	writeLock sync.Mutex   // Limit to one write transaction at a time.
-	closeLock sync.RWMutex // Make database close block while txns active.
-	closed    bool         // Is the database closed?
-	store     *blockStore  // Handles read/writing blocks to flat files.
-	cache     *dbCache     // Cache layer which wraps underlying leveldb DB.
+	writeLock sync.Mutex   // Limit to one write transaction at a time. 互斥锁，保证同时只有一个可写transaction
+	closeLock sync.RWMutex // Make database close block while txns active. 保证数据库Close时所有已经打开的transaction均已结束
+	closed    bool         // Is the database closed? 指示数据库是否已经关闭
+	store     *blockStore  // Handles read/writing blocks to flat files. 指向blockStore，用于读写区块
+	cache     *dbCache     // Cache layer which wraps underlying leveldb DB.     指向dbCache，用于读写元数据
 }
 
 // Enforce db implements the database.DB interface.

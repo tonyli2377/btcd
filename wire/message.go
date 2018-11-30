@@ -1,6 +1,7 @@
 // Copyright (c) 2013-2016 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 定义了Message接口及消息封装和解析的“工厂方法”
 
 package wire
 
@@ -81,6 +82,8 @@ var LatestEncoding = WitnessEncoding
 // implements Message has complete control over the representation of its data
 // and may therefore contain additional or fewer fields than those which
 // are used directly in the protocol encoded message.
+// Message接口中BtcDecode()和BtcEncode()定义了解析和封装消息体的方法，它们在每个具体的消息定义中实现，
+// 主要是将结构化的消息体序列化为字节流或者将字节流实例化为某种消息格式
 type Message interface {
 	BtcDecode(io.Reader, uint32, MessageEncoding) error
 	BtcEncode(io.Writer, uint32, MessageEncoding) error
@@ -188,10 +191,10 @@ func makeEmptyMessage(command string) (Message, error) {
 
 // messageHeader defines the header structure for all bitcoin protocol messages.
 type messageHeader struct {
-	magic    BitcoinNet // 4 bytes
-	command  string     // 12 bytes
-	length   uint32     // 4 bytes
-	checksum [4]byte    // 4 bytes
+	magic    BitcoinNet // 4 bytes   标识Bitcoin协议消息的“魔数”，同时也用于区分Bitcoin网络，有MainNet、TestNet、TestNet3及SimNet，节点启动时可以指定在哪个网络下运行
+	command  string     // 12 bytes  协议消息包含一个命令字符串，如version、addr等，用于标识协议消息的类型
+	length   uint32     // 4 bytes   消息体的长度
+	checksum [4]byte    // 4 bytes   消息体头4个字节的双SHA256的结果
 }
 
 // readMessageHeader reads a bitcoin message header from r.
@@ -337,6 +340,8 @@ func ReadMessageWithEncodingN(r io.Reader, pver uint32, btcnet BitcoinNet,
 	enc MessageEncoding) (int, Message, []byte, error) {
 
 	totalBytes := 0
+	// 读取并解析消息头,请注意，参数r是io.Reader类型
+	// 这里的io.Reader实际为net.Conn对象，也就是读TCP Socket
 	n, hdr, err := readMessageHeader(r)
 	totalBytes += n
 	if err != nil {
@@ -344,6 +349,7 @@ func ReadMessageWithEncodingN(r io.Reader, pver uint32, btcnet BitcoinNet,
 	}
 
 	// Enforce maximum message payload.
+	// 检测头部里填的payload长度是否超过32M的限制，如果超过限制，表明它可能是一个恶意包，停止解析并返回错误
 	if hdr.length > MaxMessagePayload {
 		str := fmt.Sprintf("message payload is too large - header "+
 			"indicates %d bytes, but max message payload is %d "+
@@ -353,6 +359,7 @@ func ReadMessageWithEncodingN(r io.Reader, pver uint32, btcnet BitcoinNet,
 	}
 
 	// Check for messages from the wrong bitcoin network.
+	// 检测头部里的magic number，如果不是从指定的网络(MainNet或者TestNet)上收到的包，则丢弃
 	if hdr.magic != btcnet {
 		discardInput(r, hdr.length)
 		str := fmt.Sprintf("message from other network [%v]", hdr.magic)
@@ -360,6 +367,7 @@ func ReadMessageWithEncodingN(r io.Reader, pver uint32, btcnet BitcoinNet,
 	}
 
 	// Check for malformed commands.
+	// 检测头部里的command字段，如果包含非utf8字符，则丢弃该包
 	command := hdr.command
 	if !utf8.ValidString(command) {
 		discardInput(r, hdr.length)
@@ -368,6 +376,7 @@ func ReadMessageWithEncodingN(r io.Reader, pver uint32, btcnet BitcoinNet,
 	}
 
 	// Create struct of appropriate message type based on the command.
+	// 根据command来构造空的对应类型的消息，为解析payload作准备
 	msg, err := makeEmptyMessage(command)
 	if err != nil {
 		discardInput(r, hdr.length)
@@ -378,6 +387,7 @@ func ReadMessageWithEncodingN(r io.Reader, pver uint32, btcnet BitcoinNet,
 	// Check for maximum length based on the message type as a malicious client
 	// could otherwise create a well-formed header and set the length to max
 	// numbers in order to exhaust the machine's memory.
+	// 在读取payload之前，进一步检测头部里声明的payload长度是否超过了对应消息规定的最大长度，如果超过则丢弃
 	mpl := msg.MaxPayloadLength(pver)
 	if hdr.length > mpl {
 		discardInput(r, hdr.length)
@@ -388,6 +398,7 @@ func ReadMessageWithEncodingN(r io.Reader, pver uint32, btcnet BitcoinNet,
 	}
 
 	// Read payload.
+	// 读取payload
 	payload := make([]byte, hdr.length)
 	n, err = io.ReadFull(r, payload)
 	totalBytes += n
@@ -396,6 +407,7 @@ func ReadMessageWithEncodingN(r io.Reader, pver uint32, btcnet BitcoinNet,
 	}
 
 	// Test checksum.
+	// 在最后解析payload之前，对payload进行hash校验，检查payload是否被篡改过
 	checksum := chainhash.DoubleHashB(payload)[0:4]
 	if !bytes.Equal(checksum[:], hdr.checksum[:]) {
 		str := fmt.Sprintf("payload checksum failed - header "+
@@ -407,7 +419,7 @@ func ReadMessageWithEncodingN(r io.Reader, pver uint32, btcnet BitcoinNet,
 	// Unmarshal message.  NOTE: This must be a *bytes.Buffer since the
 	// MsgVersion BtcDecode function requires it.
 	pr := bytes.NewBuffer(payload)
-	err = msg.BtcDecode(pr, pver, enc)
+	err = msg.BtcDecode(pr, pver, enc) // 调用Message的“抽象方法”BtcDecode()对消息体进行解析，如果解析正确，则返回解析的结果
 	if err != nil {
 		return totalBytes, nil, nil, err
 	}

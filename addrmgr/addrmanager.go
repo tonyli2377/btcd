@@ -3,6 +3,8 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// 实现Peer地址的存取以及随机选择策略，是AddrManager的主要模块，它将地址集合以特定的形式存于peers.json文件中
+
 package addrmgr
 
 import (
@@ -30,22 +32,22 @@ import (
 // AddrManager provides a concurrency safe address manager for caching potential
 // peers on the bitcoin network.
 type AddrManager struct {
-	mtx            sync.Mutex
-	peersFile      string
-	lookupFunc     func(string) ([]net.IP, error)
-	rand           *rand.Rand
-	key            [32]byte
-	addrIndex      map[string]*KnownAddress // address key to ka for all addrs.
-	addrNew        [newBucketCount]map[string]*KnownAddress
-	addrTried      [triedBucketCount]*list.List
-	started        int32
-	shutdown       int32
-	wg             sync.WaitGroup
-	quit           chan struct{}
-	nTried         int
-	nNew           int
-	lamtx          sync.Mutex
-	localAddresses map[string]*localAddress
+	mtx            sync.Mutex                               //AddrManager的对象锁，保证addrManager是并发安全的
+	peersFile      string                                   //存储地址仓库的文件名，默认为“peers.json”。请注意，Bitcoind中的文件名为“peers.data”;
+	lookupFunc     func(string) ([]net.IP, error)           //进行DNS Lookup的函数值
+	rand           *rand.Rand                               //随机数生成器
+	key            [32]byte                                 //32字节的随机数数序列，用于计算NewBucket和TriedBucket的索引
+	addrIndex      map[string]*KnownAddress                 // address key to ka for all addrs. 缓存所有KnownAddress的map
+	addrNew        [newBucketCount]map[string]*KnownAddress //缓存所有新地址的map slice
+	addrTried      [triedBucketCount]*list.List             //缓存所有已经Tried的地址的list slice
+	started        int32                                    //用于标识addrmanager已经启动
+	shutdown       int32                                    //用于标识addrmanager已经停止
+	wg             sync.WaitGroup                           //用于同步退出，addrmanager停止时等待工作协程退出
+	quit           chan struct{}                            //用于通知工作协程退出
+	nTried         int                                      //记录Tried地址个数
+	nNew           int                                      //记录New地址个数
+	lamtx          sync.Mutex                               //保护localAddresses的互斥锁
+	localAddresses map[string]*localAddress                 //保存已知的本地地址
 }
 
 type serializedKnownAddress struct {
@@ -160,9 +162,22 @@ const (
 
 // updateAddress is a helper function to either update an address already known
 // to the address manager, or to add the address if not already known.
+// 其主要步骤为:
+// （1）判断欲添加的地址netAddr是否是可路由的地址，即除了保留地址以外的地址，如果是不可以路由的地址，则不加入地址仓库
+// （2）查询欲添加的地址是否已经在地址集中，如果已经在，且它的时间戳更新或者有支持新的服务，则更新地址集中KnownAddress
+// （3）检查如果地址已经在TriedBucket中，则不更新地址仓库；检查如果地址已经位于8个不同的NewBucket中，也不更新仓库；
+//      根据地址已经被NewBucket引用的个数，来随机决定是否继续添加到NewBucket中;
+// （4）如果欲添加的地址不在现有的地址集中，则需要将其添加到NewBucket中;
+// （5）经过上述检查后，如果确定需要添加地址，则调用getNewBucket()找到NewBucket的索引;
+// （6）确定了NewBucket的索引后，进一步检查欲添加的地址是否已经在对应的NewBucket时，如果是，则不再加入;
+// （7）如果欲放置新地址的NewBucket的Size已经超过newBucketSize(默认值为64)，则调用expireNew()来释放该Bucket里的一些记录。
+//      expireNew()的主要思想是将Bucket中时间戳最早的地址或者时间戳是未来时间点、或时间戳是一个月以前、
+//      或者尝试连接失败超过3次且没有成功过的地址、或最近一周连接失败超过10次的地址移除。
+// （8）最后，将新地址添加到NewBucket里。
 func (a *AddrManager) updateAddress(netAddr, srcAddr *wire.NetAddress) {
 	// Filter out non-routable addresses. Note that non-routable
 	// also includes invalid and local addresses.
+	// 判断欲添加的地址netAddr是否是可路由的地址，即除了保留地址以外的地址，如果是不可以路由的地址，则不加入地址仓库
 	if !IsRoutable(netAddr) {
 		return
 	}
@@ -176,10 +191,11 @@ func (a *AddrManager) updateAddress(netAddr, srcAddr *wire.NetAddress) {
 		// messages the netaddresses in addrmaanger are *immutable*,
 		// if we need to change them then we replace the pointer with a
 		// new copy so that we don't have to copy every na for getaddr.
+		// 查询欲添加的地址是否已经在地址集中，如果已经在，且它的时间戳更新或者有支持新的服务，则更新地址集中KnownAddress，
+		// 请注意，这里的时间戳是指节点最近获知该地址的时间点
 		if netAddr.Timestamp.After(ka.na.Timestamp) ||
 			(ka.na.Services&netAddr.Services) !=
 				netAddr.Services {
-
 			naCopy := *ka.na
 			naCopy.Timestamp = netAddr.Timestamp
 			naCopy.AddService(netAddr.Services)
@@ -187,11 +203,13 @@ func (a *AddrManager) updateAddress(netAddr, srcAddr *wire.NetAddress) {
 		}
 
 		// If already in tried, we have nothing to do here.
+		// 检查如果地址已经在TriedBucket中，则不更新地址仓库；
 		if ka.tried {
 			return
 		}
 
 		// Already at our max?
+		// 检查如果地址已经位于8个不同的NewBucket中，也不更新仓库；
 		if ka.refs == newBucketsPerAddress {
 			return
 		}
@@ -199,6 +217,7 @@ func (a *AddrManager) updateAddress(netAddr, srcAddr *wire.NetAddress) {
 		// The more entries we have, the less likely we are to add more.
 		// likelihood is 2N.
 		factor := int32(2 * ka.refs)
+		// 根据地址已经被NewBucket引用的个数，来随机决定是否继续添加到NewBucket中
 		if a.rand.Int31n(factor) != 0 {
 			return
 		}
@@ -206,21 +225,25 @@ func (a *AddrManager) updateAddress(netAddr, srcAddr *wire.NetAddress) {
 		// Make a copy of the net address to avoid races since it is
 		// updated elsewhere in the addrmanager code and would otherwise
 		// change the actual netaddress on the peer.
-		netAddrCopy := *netAddr
+		netAddrCopy := *netAddr //如果欲添加的地址不在现有的地址集中，则需要将其添加到NewBucket中
 		ka = &KnownAddress{na: &netAddrCopy, srcAddr: srcAddr}
 		a.addrIndex[addr] = ka
 		a.nNew++
 		// XXX time penalty?
 	}
 
-	bucket := a.getNewBucket(netAddr, srcAddr)
+	bucket := a.getNewBucket(netAddr, srcAddr) //经过上述检查后，如果确定需要添加地址，则调用getNewBucket()找到NewBucket的索引
 
 	// Already exists?
+	// 确定了NewBucket的索引后，进一步检查欲添加的地址是否已经在对应的NewBucket时，如果是，则不再加入
 	if _, ok := a.addrNew[bucket][addr]; ok {
 		return
 	}
 
 	// Enforce max addresses.
+	// 如果欲放置新地址的NewBucket的Size已经超过newBucketSize(默认值为64)，则调用expireNew()来释放该Bucket里的一些记录
+	// expireNew()的主要思想是将Bucket中时间戳最早的地址或者时间戳是未来时间点、或时间戳是一个月以前、
+	// 或者尝试连接失败超过3次且没有成功过的地址、或最近一周连接失败超过10次的地址移除。
 	if len(a.addrNew[bucket]) > newBucketSize {
 		log.Tracef("new bucket is full, expiring old")
 		a.expireNew(bucket)
@@ -228,7 +251,7 @@ func (a *AddrManager) updateAddress(netAddr, srcAddr *wire.NetAddress) {
 
 	// Add to new bucket.
 	ka.refs++
-	a.addrNew[bucket][addr] = ka
+	a.addrNew[bucket][addr] = ka //最后，将新地址添加到NewBucket里
 
 	log.Tracef("Added new address %s for a total of %d addresses", addr,
 		a.nTried+a.nNew)
@@ -294,6 +317,7 @@ func (a *AddrManager) pickTried(bucket int) *list.Element {
 func (a *AddrManager) getNewBucket(netAddr, srcAddr *wire.NetAddress) int {
 	// bitcoind:
 	// doublesha256(key + sourcegroup + int64(doublesha256(key + group + sourcegroup))%bucket_per_source_group) % num_new_buckets
+	// NewBucket的索引由AddrManager的随机序列key、地址newAddr及通告该地址的Peer的地址srcAddr共同决定
 
 	data1 := []byte{}
 	data1 = append(data1, a.key[:]...)
@@ -335,6 +359,7 @@ func (a *AddrManager) getTriedBucket(netAddr *wire.NetAddress) int {
 
 // addressHandler is the main handler for the address manager.  It must be run
 // as a goroutine.
+// 每隔dumpAddressInterval(值为10分钟)调用savePeers()将addrMananager中的地址集写入文件，savePeers()是与deserializePeers()对应的实例化方法
 func (a *AddrManager) addressHandler() {
 	dumpAddressTicker := time.NewTicker(dumpAddressInterval)
 	defer dumpAddressTicker.Stop()
@@ -432,31 +457,45 @@ func (a *AddrManager) loadPeers() {
 	log.Infof("Loaded %d addresses from file '%s'", a.numAddresses(), a.peersFile)
 }
 
+//其主要过程为:
+//（1）读取文件，并通过json解析器将json文件实例化为serializedAddrManager对象;
+//（2）校验版本号，并读取随机数序列Key;
+//（3）将serializedKnownAddress解析为KnownAddress，并存入a.addrIndex中。
+//     需要注意的是，serializedKnownAddress中的地址均是string，而KnownAddress对应的地址是wire.NetAddress类型，
+//     在转换过程中，如果serializedKnownAddress为“.onion”的洋葱地址，则将“.onion”前的字符串转换成大写后进行base32解码，
+//     并添加“fd87:d87e:eb43”前缀转换成IPv6地址；如果是hostname，则调用lookupFunc将解析为IP地址；
+//     同时，addrIndex的key是地址的string形式，如果是IP:Port的形式，则直接将IP和Port转换为对应的数字字符，
+//     如果是以“fd87:d87e:eb43”开头的IPv6地址，则将该地址的后10位进行base32编码并转成小写后的字符串，加上“.onion”后缀转换为洋葱地址形式。
+//     具体转换过程在ipString()和HostToNetAddress()中实现;
+//（4）以serializedAddrManager的NewBuckets和TriedBuckets中的地址为Key，查找addrIndex中对应的KnownAddress后，填充addrNew和addrTried;
+//（5）最后对实例化的结果作Sanity检查，保证一个地址要么在NewBuckets中，要么在TridBuckets中;
 func (a *AddrManager) deserializePeers(filePath string) error {
-
 	_, err := os.Stat(filePath)
 	if os.IsNotExist(err) {
 		return nil
 	}
-	r, err := os.Open(filePath)
+	r, err := os.Open(filePath) //读取peers.json文件
 	if err != nil {
 		return fmt.Errorf("%s error opening file: %v", filePath, err)
 	}
 	defer r.Close()
 
 	var sam serializedAddrManager
+	// 通过json解析器将json文件实例化为serializedAddrManager对象
 	dec := json.NewDecoder(r)
 	err = dec.Decode(&sam)
 	if err != nil {
 		return fmt.Errorf("error reading %s: %v", filePath, err)
 	}
 
+	//校验版本号
 	if sam.Version != serialisationVersion {
 		return fmt.Errorf("unknown version %v in serialized "+
 			"addrmanager", sam.Version)
 	}
 	copy(a.key[:], sam.Key[:])
 
+	//读取随机数序列Key
 	for _, v := range sam.Addresses {
 		ka := new(KnownAddress)
 		ka.na, err = a.DeserializeNetAddress(v.Addr)
@@ -472,7 +511,7 @@ func (a *AddrManager) deserializePeers(filePath string) error {
 		ka.attempts = v.Attempts
 		ka.lastattempt = time.Unix(v.LastAttempt, 0)
 		ka.lastsuccess = time.Unix(v.LastSuccess, 0)
-		a.addrIndex[NetAddressKey(ka.na)] = ka
+		a.addrIndex[NetAddressKey(ka.na)] = ka //将serializedKnownAddress解析为KnownAddress，并存入a.addrIndex中
 	}
 
 	for i := range sam.NewBuckets {
@@ -536,6 +575,8 @@ func (a *AddrManager) DeserializeNetAddress(addr string) (*wire.NetAddress, erro
 
 // Start begins the core address handler which manages a pool of known
 // addresses, timeouts, and interval based writes.
+// 调用loadPeers()来将peers.json文件中的地址集实例化，然后启动工作协程addressHandler来周期性性向文件保存新的地址。
+// loadPeers()主要是调用deserializePeers()将文件反序列化
 func (a *AddrManager) Start() {
 	// Already started?
 	if atomic.AddInt32(&a.started, 1) != 1 {
@@ -738,6 +779,15 @@ func NetAddressKey(na *wire.NetAddress) string {
 // random one from the possible addresses with preference given to ones that
 // have not been used recently and should not pick 'close' addresses
 // consecutively.
+// GetAddress()实现了“AddrManage是如何选择一个地址，以供节点建立Peer连接的”
+// 其主要步骤为:
+// （1）如地址集中NewBucket和TriedBucket，即既有已经尝试连接过的“老”地址，也有未连接过的“新”地址，则按50%的概率随机地从NewBucket或TriedBucket中选择;
+// （2）如果决定从TriedBucket中选择，则随机选择一个TriedBucket;
+// （3）从随机选择的TriedBucket中，再随机地选择一个地址;
+// （4）再判断选择的地址是否满足一个随机条件，如果满足则返回该地址；如果不满足，则增加factor因子以增加满足随机条件的概率，并重复2-4步骤。
+//      这个随机条件是: 从0 ~ 102410241024 范围内随机选择一个数，这个随机数是否小于它乘以factor和ka.chance()的结果。
+//      可以看到，factor或者ka.chance越大，该条件成立的概率越大;
+// （5）如果决定从NewBucket中选择，则采取与TriedBucket相似的步骤随机选择地址;
 func (a *AddrManager) GetAddress() *KnownAddress {
 	// Protect concurrent access.
 	a.mtx.Lock()
@@ -852,17 +902,31 @@ func (a *AddrManager) Connected(addr *wire.NetAddress) {
 // Good marks the given address as good.  To be called after a successful
 // connection and version exchange.  If the address is unknown to the address
 // manager it will be ignored.
+// 调用Good()来将地址从NewBucket移入TriedBucket
+// 其主要过程如下:
+// （1）查询连成功的地址是否在地址集中，如果不在，则不作处理;
+// （2）如果地址在地址集中，则更新该地址的lastsuccess和lastattempt为当前时间点，且将试图重试次数attempts重置;
+// （3）如果地址已经在TrieBucket中，则只更新lastsuccess、lastattempt和attempts即可，我们将在GetAddress()中看到，
+//      AddrManager选择地址建Peer时，会随机地从NewBucket和TriedBucket中选择;
+// （4）如果地址在NewBucket中，则将其从对应的Bucket中移除；请注意，这里记录下了地址所处的NewBucket的索引号oldBucket，它将在后面用到;
+// （5）选择一个TriedBucket的索引号，用于将地址添加进对应的Bucket;
+// （6）如果选择的TriedBucket未填满(容量为256)，则将地址添加到Bucket;
+// （7）如果选择的TriedBucket已经填满，则调用pickTried()从其中选择一个地址，准备将其移动到NewBucket中以腾出空间;
+// （8）如果欲移入的NewBucket已经满，则将选择的地址从TriedBucket中移入索引号为oldBucket的NewBucket中，即移入刚刚移除了addr的NewBucket中;
+// （9）将连接成功的地址添加到选择的TriedBucket中，通过将listElement的Value直接更新为对应的ka来实现;
+// （10）将从TriedBucket中移出的地址移入选择的NewBucket中;
 func (a *AddrManager) Good(addr *wire.NetAddress) {
 	a.mtx.Lock()
 	defer a.mtx.Unlock()
 
-	ka := a.find(addr)
+	ka := a.find(addr) // 查询连成功的地址是否在地址集中，如果不在，则不作处理
 	if ka == nil {
 		return
 	}
 
 	// ka.Timestamp is not updated here to avoid leaking information
 	// about currently connected peers.
+	// 如果地址在地址集中，则更新该地址的lastsuccess和lastattempt为当前时间点，且将试图重试次数attempts重置
 	now := time.Now()
 	ka.lastsuccess = now
 	ka.lastattempt = now
@@ -882,10 +946,10 @@ func (a *AddrManager) Good(addr *wire.NetAddress) {
 	for i := range a.addrNew {
 		// we check for existence so we can record the first one
 		if _, ok := a.addrNew[i][addrKey]; ok {
-			delete(a.addrNew[i], addrKey)
+			delete(a.addrNew[i], addrKey) // 如果地址在NewBucket中，则将其从对应的Bucket中移除
 			ka.refs--
 			if oldBucket == -1 {
-				oldBucket = i
+				oldBucket = i // 记录下了地址所处的NewBucket的索引号oldBucket，它将在后面用到
 			}
 		}
 	}
@@ -896,17 +960,18 @@ func (a *AddrManager) Good(addr *wire.NetAddress) {
 		return
 	}
 
-	bucket := a.getTriedBucket(ka.na)
+	bucket := a.getTriedBucket(ka.na) // 选择一个TriedBucket的索引号，用于将地址添加进对应的Bucket
 
 	// Room in this tried bucket?
 	if a.addrTried[bucket].Len() < triedBucketSize {
 		ka.tried = true
-		a.addrTried[bucket].PushBack(ka)
+		a.addrTried[bucket].PushBack(ka) //如果选择的TriedBucket未填满(容量为256)，则将地址添加到Bucket
 		a.nTried++
 		return
 	}
 
 	// No room, we have to evict something else.
+	// 如果选择的TriedBucket已经填满，则调用pickTried()从其中选择一个地址，准备将其移动到NewBucket中以腾出空间
 	entry := a.pickTried(bucket)
 	rmka := entry.Value.(*KnownAddress)
 
@@ -916,12 +981,12 @@ func (a *AddrManager) Good(addr *wire.NetAddress) {
 	// If no room in the original bucket, we put it in a bucket we just
 	// freed up a space in.
 	if len(a.addrNew[newBucket]) >= newBucketSize {
-		newBucket = oldBucket
+		newBucket = oldBucket //如果欲移入的NewBucket已经满，则将选择的地址从TriedBucket中移入索引号为oldBucket的NewBucket中，即移入刚刚移除了addr的NewBucket中
 	}
 
 	// replace with ka in list.
 	ka.tried = true
-	entry.Value = ka
+	entry.Value = ka //将连接成功的地址添加到选择的TriedBucket中，通过将listElement的Value直接更新为对应的ka来实现
 
 	rmka.tried = false
 	rmka.refs++
@@ -935,7 +1000,7 @@ func (a *AddrManager) Good(addr *wire.NetAddress) {
 	log.Tracef("Replacing %s with %s in tried", rmkey, addrKey)
 
 	// We made sure there is space here just above.
-	a.addrNew[newBucket][rmkey] = rmka
+	a.addrNew[newBucket][rmkey] = rmka // 将从TriedBucket中移出的地址移入选择的NewBucket中
 }
 
 // SetServices sets the services for the giiven address to the provided value.

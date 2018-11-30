@@ -1,6 +1,7 @@
 // Copyright (c) 2013-2015 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 定义了NetAddress类型
 
 package wire
 
@@ -13,6 +14,7 @@ import (
 
 // maxNetAddressPayload returns the max payload size for a bitcoin NetAddress
 // based on the protocol version.
+//
 func maxNetAddressPayload(pver uint32) uint32 {
 	// Services 8 bytes + ip 16 bytes + port 2 bytes.
 	plen := uint32(26)
@@ -33,9 +35,12 @@ type NetAddress struct {
 	// uint32 on the wire and therefore is limited to 2106.  This field is
 	// not present in the bitcoin version message (MsgVersion) nor was it
 	// added until protocol version >= NetAddressTimeVersion.
+	// 记录节点从“外部”获知该地址的最近时间点，该时刻离现在越早，说明该地址的“存活期”越长，对应地址失效的可能性就越大。
+	// 值得注意的是，version消息里的发送端(AddrMe)和接收端地址(AddrYou)里并没有包含该字段
 	Timestamp time.Time
 
 	// Bitfield which identifies the services supported by the address.
+	// 表明节点支持的服务，也即节点类型，包含SFNodeNetwork、SFNodeGetUTXO和SFNodeBloom
 	Services ServiceFlag
 
 	// IP address of the peer.

@@ -1,6 +1,8 @@
 // Copyright (c) 2016-2017 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 定义了新的共识规则在向区块链网络部署时的状态，按部署或者节点接受的进度依次为Defined、Started、LockedIn、Active或者Failed等状态，
+// 更重要地，实现了状态转换的算法和计算区块上某个共识规则的部署状态的方法
 
 package blockchain
 

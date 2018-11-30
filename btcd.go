@@ -2,7 +2,6 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
-//LL
 package main
 
 import (
@@ -145,8 +144,7 @@ func btcdMain(serverChan chan<- *server) error {
 	}
 
 	// Create server and start it.
-	server, err := newServer(cfg.Listeners, db, activeNetParams.Params,
-		interrupt)
+	server, err := newServer(cfg.Listeners, db, activeNetParams.Params, interrupt)
 	if err != nil {
 		// TODO: this logging could do with some beautifying.
 		btcdLog.Errorf("Unable to start server on %v: %v",

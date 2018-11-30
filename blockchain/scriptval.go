@@ -1,6 +1,7 @@
 // Copyright (c) 2013-2016 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 实现了验证交易中的锁定脚本与解锁脚本的机制，支持并发地验证多个脚本对
 
 package blockchain
 

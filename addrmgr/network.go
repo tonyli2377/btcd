@@ -2,6 +2,8 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// 定义不同IP地址类型，并提供类型判断方法
+
 package addrmgr
 
 import (

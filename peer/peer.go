@@ -10,6 +10,12 @@ import (
 	"container/list"
 	"errors"
 	"fmt"
+	"github.com/btcsuite/btcd/blockchain"
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/go-socks/socks"
+	"github.com/davecgh/go-spew/spew"
 	"io"
 	"math/rand"
 	"net"
@@ -17,13 +23,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/btcsuite/btcd/blockchain"
-	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
-	"github.com/btcsuite/go-socks/socks"
-	"github.com/davecgh/go-spew/spew"
 )
 
 const (
@@ -1006,8 +1005,8 @@ func (p *Peer) handlePongMsg(msg *wire.MsgPong) {
 
 // readMessage reads the next bitcoin message from the peer with logging.
 func (p *Peer) readMessage(encoding wire.MessageEncoding) (wire.Message, []byte, error) {
-	n, msg, buf, err := wire.ReadMessageWithEncodingN(p.conn,
-		p.ProtocolVersion(), p.cfg.ChainParams.Net, encoding)
+	// 真正的收发消息都由wire的ReadMessage()和WriteMessage()处理
+	n, msg, buf, err := wire.ReadMessageWithEncodingN(p.conn, p.ProtocolVersion(), p.cfg.ChainParams.Net, encoding)
 	atomic.AddUint64(&p.bytesReceived, uint64(n))
 	if p.cfg.Listeners.OnRead != nil {
 		p.cfg.Listeners.OnRead(p, n, msg, err)
@@ -1069,6 +1068,7 @@ func (p *Peer) writeMessage(msg wire.Message, enc wire.MessageEncoding) error {
 	}))
 
 	// Write the message to the peer.
+	// 真正的收发消息都由wire的ReadMessage()和WriteMessage()处理
 	n, err := wire.WriteMessageWithEncodingN(p.conn, msg,
 		p.ProtocolVersion(), p.cfg.ChainParams.Net, enc)
 	atomic.AddUint64(&p.bytesSent, uint64(n))
@@ -1171,6 +1171,12 @@ func (p *Peer) maybeAddDeadline(pendingResponses map[string]time.Time, msgCmd st
 // stallHandler handles stall detection for the peer.  This entails keeping
 // track of expected responses and assigning them deadlines while accounting for
 // the time spent in callbacks.  It must be run as a goroutine.
+// queueHandler()通过outputQueue和outputInvChan这两上带缓冲的channel，以及pendingMsgs和invSendQueue两个List，实现了发送消息列队；
+// 而且，它通过缓存大小为1的channel sendQueue保证待发送消息按顺序串行发送。
+// inHandler，outHandler和queueHandler在不同goroutine中执行，实现了异步收发消息。
+// 然而正如我们在inHandler中所了解的，消息的接收处理也是一条一条地串行处理的，如果没有超时控制，假如某一时间段内发送队列中有大量待发送消息，
+// 而且inHandler中处理某些消息太耗时导致后续消息无法读取时，Peer之间的消息交换将发生严重的“拥塞”。
+// 为了防止这种情况，stallHandler中作了超时处理
 func (p *Peer) stallHandler() {
 	// These variables are used to adjust the deadline times forward by the
 	// time it takes callbacks to execute.  This is done because new
@@ -1201,14 +1207,20 @@ out:
 			case sccSendMessage:
 				// Add a deadline for the expected response
 				// message if needed.
-				p.maybeAddDeadline(pendingResponses,
-					msg.message.Command())
+				// 当收到outHandler发来的sccSendMessage时，将为已经发送的消息设定收到响应消息的超时时间deadline，并缓存入pendingResponses中
+				p.maybeAddDeadline(pendingResponses, msg.message.Command())
 
 			case sccReceiveMessage:
 				// Remove received messages from the expected
 				// response map.  Since certain commands expect
 				// one of a group of responses, remove
 				// everything in the expected group accordingly.
+				// 当收到inHandler发来的sccReceiveMessage时，如果是响应消息，则将对应消息命令和其deadline从pendingResponses中移除，
+				// 不需要再跟踪该消息响应是否超时。请注意这里只是根据消息命令或者类型来匹配请求和响应，并没有通过序列号或请求ID来严格匹配，
+				// 这一方面是由于节点对收和发均作了串行化处理，另一方面是由于节点同步到最新区块后，Peer之间的消息交换并不是非常频繁;
+
+				//当收到inHandler发来的sccHandlerStart时，说明inHandler开始处理接收到的消息，为了防止下一条响应消息因为当前消息处理时间过程而导致超时，
+				// stallHandler将在收到sccHandlerStart和sccHandlerDone时，计算处理当前消息的时间，并在检测下一条响应消息是否超时时将前一条消息的处理时间考虑进去
 				switch msgCmd := msg.message.Command(); msgCmd {
 				case wire.CmdBlock:
 					fallthrough
@@ -1237,7 +1249,8 @@ out:
 
 				handlerActive = true
 				handlersStartTime = time.Now()
-
+			// 收到inHandler发来的sccHandlerDone时，表明当前接收到的消息已经处理完毕，用当前时间减去开始处理消息的时点，
+			// 即得到处理消息所花费的时间deadlineOffset，这个时间差将被用于调节下一个响应消息的超时门限;
 			case sccHandlerDone:
 				// Warn on unbalanced callback signalling.
 				if !handlerActive {
@@ -1258,6 +1271,11 @@ out:
 					msg.command)
 			}
 
+		// stallTicker每隔15s触发，用于周期性地检查是否有消息的响应超时，如果有响应已经超时，则主动断开该Peer连接。
+		// 如果在当前检查时点与上一个检查时点之间有一条接收消息正在处理或者刚处理完毕，则超时门限延长前一条接收消息的处理时长
+		// 以免因前一条消息处理太耗时而导致下一条响应消息超时。然而，如果某一条消息的处理时间过长，导致有多于1条响应消息被延迟读取和处理，
+		// 则下一条消息之后的响应消息大概仍然会超时，所以要避免在处理接收消息的回调函数中作耗时操作；如果网络延时大，
+		// 导致inHandler读取下一条响应消息时等待时间过长，也会导致超时
 		case <-stallTicker.C:
 			// Calculate the offset to apply to the deadline based
 			// on how long the handlers have taken to execute since
@@ -1285,6 +1303,7 @@ out:
 			// Reset the deadline offset for the next tick.
 			deadlineOffset = 0
 
+		// 保证当inHandler和outHandler均退出后，stallHandler才结束处理循环，准备退出
 		case <-p.inQuit:
 			// The stall handler can exit once both the input and
 			// output handler goroutines are done.
@@ -1293,6 +1312,7 @@ out:
 			}
 			ioStopped = true
 
+		// 保证当inHandler和outHandler均退出后，stallHandler才结束处理循环，准备退出
 		case <-p.outQuit:
 			// The stall handler can exit once both the input and
 			// output handler goroutines are done.
@@ -1305,6 +1325,7 @@ out:
 
 	// Drain any wait channels before going away so there is nothing left
 	// waiting on this goroutine.
+	// stallHandler将stallControl channel中的消息清空，并最后退出
 cleanup:
 	for {
 		select {
@@ -1318,9 +1339,11 @@ cleanup:
 
 // inHandler handles all incoming messages for the peer.  It must be run as a
 // goroutine.
+// inHandler协程主要处理接收消息，并回调MessageListener中的消息处理函数对消息进行处理
 func (p *Peer) inHandler() {
 	// The timer is stopped when a new message is received and reset after it
 	// is processed.
+	// 设定一个idleTimer，其超时时间为5分钟。如果每隔5分钟内没有从Peer接收到消息，则主动与该Peer断开连接。
 	idleTimer := time.AfterFunc(idleTimeout, func() {
 		log.Warnf("Peer %s no answer for %s -- disconnecting", p, idleTimeout)
 		p.Disconnect()
@@ -1331,6 +1354,7 @@ out:
 		// Read a message and stop the idle timer as soon as the read
 		// is done.  The timer is reset below for the next iteration if
 		// needed.
+		// 消息读取
 		rmsg, buf, err := p.readMessage(p.wireEncoding)
 		idleTimer.Stop()
 		if err != nil {
@@ -1365,6 +1389,7 @@ out:
 			break out
 		}
 		atomic.StoreInt64(&p.lastRecv, time.Now().Unix())
+		//inHandler向stallHandler通过stallControl channel发送了sccReceiveMessage消息，并随后发送了sccHandlerStart，stallHandler会根据这些消息来计算节点接收并处理消息所消耗的时间
 		p.stallControl <- stallControlMsg{sccReceiveMessage, rmsg}
 
 		// Handle each supported message type.
@@ -1389,7 +1414,7 @@ out:
 			p.verAckReceived = true
 			p.flagsMtx.Unlock()
 			if p.cfg.Listeners.OnVerAck != nil {
-				p.cfg.Listeners.OnVerAck(p, msg)
+				p.cfg.Listeners.OnVerAck(p, msg) // 回调MessageListener中的消息处理函数对消息进行处理
 			}
 
 		case *wire.MsgGetAddr:
@@ -1532,9 +1557,11 @@ out:
 			log.Debugf("Received unhandled message of type %v "+
 				"from %v", rmsg.Command(), p)
 		}
+		// 在处理完一条消息后，inHandler向stallHandler发送sccHandlerDone，通知stallHandler消息处理完毕。
 		p.stallControl <- stallControlMsg{sccHandlerDone, rmsg}
 
 		// A message was received so reset the idle timer.
+		// 将idleTimer复位再次开始计时，并等待读取下一条消息
 		idleTimer.Reset(idleTimeout)
 	}
 
@@ -1542,9 +1569,10 @@ out:
 	idleTimer.Stop()
 
 	// Ensure connection is closed.
+	// 调用Disconnect()强制与Peer断开连接
 	p.Disconnect()
 
-	close(p.inQuit)
+	close(p.inQuit) //通过inQuit channel向stallHandler通知自己已经退出
 	log.Tracef("Peer input handler done for %s", p)
 }
 
@@ -1552,6 +1580,8 @@ out:
 // a muxer for various sources of input so we can ensure that server and peer
 // handlers will not block on us sending a message.  That data is then passed on
 // to outHandler to be actually written.
+// 发送消息的队列由queueHandler维护，它通过sendQueue将队列中的消息送往outHandler并向Peer发送。
+// queueHandler还专门处理了Inventory的发送
 func (p *Peer) queueHandler() {
 	pendingMsgs := list.New()
 	invSendQueue := list.New()
@@ -1568,6 +1598,7 @@ func (p *Peer) queueHandler() {
 	waiting := false
 
 	// To avoid duplication below.
+
 	queuePacket := func(msg outMsg, list *list.List, waiting bool) bool {
 		if !waiting {
 			p.sendQueue <- msg
@@ -1579,12 +1610,16 @@ func (p *Peer) queueHandler() {
 	}
 out:
 	for {
+		// 开始循环处理channel消息。请注意，这里的select语句没有定义default分支，也就是说管道中没有数据时，循环将阻塞在select语句处
 		select {
+		// 当从outputQueue接收到待发送消息时，如果有消息正在通过outHandler发送，则通过queuePacket函数将消息缓存到pendingMsgs或invSendQueue
 		case msg := <-p.outputQueue:
+			// 当有发送消息的请求时，发送方向outputQueue写入数据，接收代码将会被触发，并调用queuePacket()，要么立即发向outHandler，要么缓存起来排队发送;
 			waiting = queuePacket(msg, pendingMsgs, waiting)
 
 		// This channel is notified when a message has been sent across
 		// the network socket.
+		// 当outHandler发送完一条消息时，它向sendDoneQueue写入数据，接收代码被触发，queueHandler从缓存在pendingMsgs中的待发送消息取出一条发往outHandler;
 		case <-p.sendDoneQueue:
 			// No longer waiting if there are no more messages
 			// in the pending messages queue.
@@ -1599,6 +1634,7 @@ out:
 			val := pendingMsgs.Remove(next)
 			p.sendQueue <- val.(outMsg)
 
+		// 当要发送Inventory时，发送方向outputInvChan写入数据，接收代码被触发，待发送的Inventory将被缓存到invSendQueue中
 		case iv := <-p.outputInvChan:
 			// No handshake?  They'll find out soon enough.
 			if p.VersionKnown() {
@@ -1617,6 +1653,7 @@ out:
 				}
 			}
 
+		//trickleTicker 10s被触发一次
 		case <-trickleTicker.C:
 			// Don't send anything if we're disconnecting or there
 			// is no queued inventory.
@@ -1629,16 +1666,19 @@ out:
 			// Create and send as many inv messages as needed to
 			// drain the inventory send queue.
 			invMsg := wire.NewMsgInvSizeHint(uint(invSendQueue.Len()))
+			// 它首先从invSendQueue中取出一条Inventory
 			for e := invSendQueue.Front(); e != nil; e = invSendQueue.Front() {
 				iv := invSendQueue.Remove(e).(*wire.InvVect)
 
 				// Don't send inventory that became known after
 				// the initial check.
+				// 验证它是否已经向Peer发送过
 				if p.knownInventory.Exists(iv) {
 					continue
 				}
-
+				// 如果是新的Inventroy，则将各个Inventory组成Inventory Vector，通过inv消息发往Peer
 				invMsg.AddInvVect(iv)
+				// 限制每个inv消息里的Inventory Vector的size最大为1000，当超过该限制时，invSendQueue中的Inventory将分成多个inv消息发送。
 				if len(invMsg.InvList) >= maxInvTrickleSize {
 					waiting = queuePacket(
 						outMsg{msg: invMsg},
@@ -1648,13 +1688,14 @@ out:
 
 				// Add the inventory that is being relayed to
 				// the known inventory for the peer.
+				// 将发送过的Inventory缓存下来，以防后面重复发送;
 				p.AddKnownInventory(iv)
 			}
 			if len(invMsg.InvList) > 0 {
-				waiting = queuePacket(outMsg{msg: invMsg},
-					pendingMsgs, waiting)
+				waiting = queuePacket(outMsg{msg: invMsg}, pendingMsgs, waiting)
 			}
 
+		// 当调用Peer的Disconnect()时，p.quit的接收代码会被触发，循环退出
 		case <-p.quit:
 			break out
 		}
@@ -1662,6 +1703,7 @@ out:
 
 	// Drain any wait channels before we go away so we don't leave something
 	// waiting for us.
+	// 将pendingMsgs中的待发送消息清空
 	for e := pendingMsgs.Front(); e != nil; e = pendingMsgs.Front() {
 		val := pendingMsgs.Remove(e)
 		msg := val.(outMsg)
@@ -1669,6 +1711,8 @@ out:
 			msg.doneChan <- struct{}{}
 		}
 	}
+
+	// 将管道中的消息清空，随后通过queueQuit channel通知outHandler退出
 cleanup:
 	for {
 		select {
@@ -1710,11 +1754,22 @@ func (p *Peer) shouldLogWriteError(err error) bool {
 // outHandler handles all outgoing messages for the peer.  It must be run as a
 // goroutine.  It uses a buffered channel to serialize output messages while
 // allowing the sender to continue running asynchronously.
+// inHandler协程主要处理接收消息，并回调MessageListener中的消息处理函数对消息进行处理
+// outHandler主要发送消息
+// outHandler主要是从sendQueue循环取出消息，并调用writeMessage()向Peer发送消息
+// 消息发送前，它向stallHandler发送sccSendMessage消息，通知stallHandler开始跟踪这条消息的响应是否超时
+// 消息发成功后，通过sendDoneQueue channel通知queueHandler发送下一条消息
+// 需要注意的是，sendQueue是buffer size为1的channel，它与sendDoneQueue配合保证发送缓冲队列outputQueue里的消息按顺序一一发送
+// 当Peer断开连接时，p.quit的接收代码会被触发，从而让循环退出。
+// 通过queueQuit同步，outHandler退出之前需要等待queueHandler退出，是为了让queueHandler将发送缓冲中的消息清空。
+// 最后，通过outQuit channel通知stallHandler自己退出。
+// 发送消息的队列由queueHandler维护，它通过sendQueue将队列中的消息送往outHandler并向Peer发送
+// queueHandler还专门处理了Inventory的发送
 func (p *Peer) outHandler() {
 out:
 	for {
 		select {
-		case msg := <-p.sendQueue:
+		case msg := <-p.sendQueue: //从sendQueue循环取出消息
 			switch m := msg.msg.(type) {
 			case *wire.MsgPing:
 				// Only expects a pong message in later protocol
@@ -1726,10 +1781,10 @@ out:
 					p.statsMtx.Unlock()
 				}
 			}
-
+			//向stallHandler发送sccSendMessage消息，通知stallHandler开始跟踪这条消息的响应是否超时
 			p.stallControl <- stallControlMsg{sccSendMessage, msg.msg}
 
-			err := p.writeMessage(msg.msg, msg.encoding)
+			err := p.writeMessage(msg.msg, msg.encoding) //调用writeMessage()向Peer发送消息
 			if err != nil {
 				p.Disconnect()
 				if p.shouldLogWriteError(err) {
@@ -1751,7 +1806,7 @@ out:
 			if msg.doneChan != nil {
 				msg.doneChan <- struct{}{}
 			}
-			p.sendDoneQueue <- struct{}{}
+			p.sendDoneQueue <- struct{}{} //通过sendDoneQueue channel通知queueHandler发送下一条消息
 
 		case <-p.quit:
 			break out
@@ -1781,8 +1836,12 @@ cleanup:
 }
 
 // pingHandler periodically pings the peer.  It must be run as a goroutine.
+// stallHandler跟踪发送消息与对应的响应消息，每隔15s检查是否有响应消息超时，同时修正了当前响应消息处理时间对下一条响应消息超时检查的影响，
+// 当超时发生时主动断开与Peer的连接，可以重新选择其它Peer开始同步，保证了Peer收发消息时不会因网络延迟或处理耗时而影响区块同步效率。
+// 当然，为了维持和Peer之间的连接关系，当前节点与Peer节点之间定时发送Ping/Pong心跳，Ping消息的发送由pingHandler来处理，Peer节点收到后回复Pong消息。
+// pingHandler的逻辑相对简单，主要是以2分钟为周期向Peer发送Ping消息；当p.quit被关闭时，pingHandler退出。
 func (p *Peer) pingHandler() {
-	pingTicker := time.NewTicker(pingInterval)
+	pingTicker := time.NewTicker(pingInterval) // 以2分钟为周期
 	defer pingTicker.Stop()
 
 out:
@@ -1796,6 +1855,7 @@ out:
 			}
 			p.QueueMessage(wire.NewMsgPing(nonce), nil)
 
+		// 当p.quit被关闭时，pingHandler退出
 		case <-p.quit:
 			break out
 		}
@@ -1880,6 +1940,8 @@ func (p *Peer) Disconnect() {
 // readRemoteVersionMsg waits for the next message to arrive from the remote
 // peer.  If the next message is not a version message or the version is not
 // acceptable then return an error.
+// 1. 读取并解析出Version消息
+// 2. 向Peer发送自己的Version消息
 func (p *Peer) readRemoteVersionMsg() error {
 	// Read their version message.
 	remoteMsg, _, err := p.readMessage(wire.LatestEncoding)
@@ -1892,13 +1954,13 @@ func (p *Peer) readRemoteVersionMsg() error {
 	msg, ok := remoteMsg.(*wire.MsgVersion)
 	if !ok {
 		reason := "a version message must precede all others"
-		rejectMsg := wire.NewMsgReject(msg.Command(), wire.RejectMalformed,
-			reason)
+		rejectMsg := wire.NewMsgReject(msg.Command(), wire.RejectMalformed, reason)
 		_ = p.writeMessage(rejectMsg, wire.LatestEncoding)
 		return errors.New(reason)
 	}
 
 	// Detect self connections.
+	//检测Version消息里的Nonce是否是自己缓存的nonce值，如果是，则表明该Version消息由自己发送给自己，在实际网络下，不允许节点自己与自己结成Peer，所以这时会返回错误
 	if !allowSelfConns && sentNonces.Exists(msg.Nonce) {
 		return errors.New("disconnecting peer connected to self")
 	}
@@ -1907,15 +1969,15 @@ func (p *Peer) readRemoteVersionMsg() error {
 	// peer advertised.
 	p.flagsMtx.Lock()
 	p.advertisedProtoVer = uint32(msg.ProtocolVersion)
-	p.protocolVersion = minUint32(p.protocolVersion, p.advertisedProtoVer)
+	p.protocolVersion = minUint32(p.protocolVersion, p.advertisedProtoVer) // 更新Peer的版本号
 	p.versionKnown = true
-	p.services = msg.Services
+	p.services = msg.Services // 更新支持的服务
 	p.flagsMtx.Unlock()
-	log.Debugf("Negotiated protocol version %d for peer %s",
-		p.protocolVersion, p)
+	log.Debugf("Negotiated protocol version %d for peer %s", p.protocolVersion, p)
 
 	// Updating a bunch of stats including block based stats, and the
 	// peer's time offset.
+	// 更新Peer的相关信息，如Peer的最新区块高度、Peer与本地节点的时间偏移等
 	p.statsMtx.Lock()
 	p.lastBlock = msg.LastBlock
 	p.startingHeight = msg.LastBlock
@@ -1925,8 +1987,8 @@ func (p *Peer) readRemoteVersionMsg() error {
 	// Set the peer's ID, user agent, and potentially the flag which
 	// specifies the witness support is enabled.
 	p.flagsMtx.Lock()
-	p.id = atomic.AddInt32(&nodeCount, 1)
-	p.userAgent = msg.UserAgent
+	p.id = atomic.AddInt32(&nodeCount, 1) // 分配一个id
+	p.userAgent = msg.UserAgent           // 更新UserAgent信息
 
 	// Determine if the peer would like to receive witness data with
 	// transactions, or not.
@@ -1959,6 +2021,7 @@ func (p *Peer) readRemoteVersionMsg() error {
 	// NOTE: If minAcceptableProtocolVersion is raised to be higher than
 	// wire.RejectVersion, this should send a reject packet before
 	// disconnecting.
+	// 检测Version消息里的ProtocolVersion，如果Peer的版本低于209，则拒绝与之相连
 	if uint32(msg.ProtocolVersion) < MinAcceptableProtocolVersion {
 		// Send a reject message indicating the protocol version is
 		// obsolete and wait for the message to be sent before
@@ -2069,10 +2132,15 @@ func (p *Peer) negotiateOutboundProtocol() error {
 }
 
 // start begins processing input and output messages.
+// 1. 起了一个goroutine来与Peer交换Version消息，调用goroutine与新的goroutine通过negotiateErr channel同步，调用goroutine阻塞等待Version握手完成;
+// 2. 如果Version握手失败或者超时，则返回错误，Peer关系建立失败;
+// 3. 如果握手成功，则启动5个新的goroutine来收发消息。其中，stallHandler()用于处理消息超时，inHandler()用于接收Peer消息，queueHandler()用于维护消息发送列队，outHandler用于向Peer发送消息，pingHandler()用于向Peer周期性地发送心跳；
+// 4. 最后，向Peer发送verack消息，双方完成握手。
 func (p *Peer) start() error {
 	log.Tracef("Starting peer %s", p)
 
 	negotiateErr := make(chan error, 1)
+	// 交换Version消息
 	go func() {
 		if p.inbound {
 			negotiateErr <- p.negotiateInboundProtocol()
@@ -2097,7 +2165,7 @@ func (p *Peer) start() error {
 	// The protocol has been negotiated successfully so start processing input
 	// and output messages.
 	go p.stallHandler()
-	go p.inHandler()
+	go p.inHandler() // inHandler handles all incoming messages for the peer.
 	go p.queueHandler()
 	go p.outHandler()
 	go p.pingHandler()
@@ -2109,6 +2177,8 @@ func (p *Peer) start() error {
 
 // AssociateConnection associates the given conn to the peer.   Calling this
 // function when the peer is already connected will have no effect.
+// 实际上，消息的收发最终是读或者写p.conn，它是一个net.Conn，也就是消息的收发都是读写Peer之间的net连接。
+// p.conn在Peer的AssociateConnection()方法中初始化，它是在connMgr成功建立起Peer之间的TCP连接后调用的。
 func (p *Peer) AssociateConnection(conn net.Conn) {
 	// Already connected?
 	if !atomic.CompareAndSwapInt32(&p.connected, 0, 1) {
@@ -2173,19 +2243,19 @@ func newPeerBase(origCfg *Config, inbound bool) *Peer {
 	p := Peer{
 		inbound:         inbound, //用于指示Peer是inbound还是outbound。如果当前节点主动连接Peer，则Peer为OutbandPeer；如果Peer主动连接当前节点，则Peer为InboundPeer;
 		wireEncoding:    wire.BaseEncoding,
-		knownInventory:  newMruInventoryMap(maxKnownInventory), // 已经发送给Peer的Inventory的缓存
-		stallControl:    make(chan stallControlMsg, 1),         // nonblocking sync
-		outputQueue:     make(chan outMsg, outputBufferSize),
-		sendQueue:       make(chan outMsg, 1),   // nonblocking sync
-		sendDoneQueue:   make(chan struct{}, 1), // nonblocking sync
-		outputInvChan:   make(chan *wire.InvVect, outputBufferSize),
-		inQuit:          make(chan struct{}),
+		knownInventory:  newMruInventoryMap(maxKnownInventory),      // 已经发送给Peer的Inventory的缓存
+		stallControl:    make(chan stallControlMsg, 1),              // 带缓冲的stallControlMsg chan，在收、发消息的goroutine和超时控制goroutine之间通信，后面会进一步介绍
+		outputQueue:     make(chan outMsg, outputBufferSize),        // 带缓冲的outMsg chan，实现了一个发送队列
+		sendQueue:       make(chan outMsg, 1),                       // 缓冲大小为1的outMsg chan，用于将outputQueue中的outMsg按加入发送队列的顺序发送给Peer
+		sendDoneQueue:   make(chan struct{}, 1),                     // 带缓冲的channel，用于通知维护发送队列的goroutine上一个消息已经发送完成，应该取下一条消息发送
+		outputInvChan:   make(chan *wire.InvVect, outputBufferSize), // 实现发送inv消息的发送队列，该队列以10s为周期向Peer发送inv消息
+		inQuit:          make(chan struct{}),                        // 用于通知收消息的goroutine已经退出
 		queueQuit:       make(chan struct{}),
-		outQuit:         make(chan struct{}),
-		quit:            make(chan struct{}),
-		cfg:             cfg, // Copy so caller can't mutate.
-		services:        cfg.Services,
-		protocolVersion: cfg.ProtocolVersion,
+		outQuit:         make(chan struct{}), // 用于通知发消息的goroutine已经退出，当收、发消息的goroutine均退出时，超时控制goroutine也将退出
+		quit:            make(chan struct{}), // 用于通知所有处理事务的goroutine退出
+		cfg:             cfg,                 // 与Peer相关的Config，其中比较重要是的Config中的MessageListeners，指明了处理从Peer收到的消息的响应函数
+		services:        cfg.Services,        // 用于记录Peer支持的服务，如: SFNodeNetwork表明Peer是一个全节点,SFNodeGetUTXO表明Peer支持getutxos和utxos命令，SFNodeBloom表明Peer支持Bloom过滤
+		protocolVersion: cfg.ProtocolVersion, // 用于记录Peer所用的协议版本
 	}
 	return &p
 }

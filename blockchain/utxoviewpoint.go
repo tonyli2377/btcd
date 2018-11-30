@@ -1,6 +1,7 @@
 // Copyright (c) 2015-2016 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 维护了UTXO的集合，包括有新的transaction时向集合中添加新的UTXO或者移除已经花费的UTXO;
 
 package blockchain
 

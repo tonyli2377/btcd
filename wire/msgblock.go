@@ -174,16 +174,17 @@ func (msg *MsgBlock) DeserializeTxLoc(r *bytes.Buffer) ([]TxLoc, error) {
 // See Serialize for encoding blocks to be stored to disk, such as in a
 // database, as opposed to encoding blocks for the wire.
 func (msg *MsgBlock) BtcEncode(w io.Writer, pver uint32, enc MessageEncoding) error {
-	err := writeBlockHeader(w, pver, &msg.Header)
+	err := writeBlockHeader(w, pver, &msg.Header) //区块头
 	if err != nil {
 		return err
 	}
 
-	err = WriteVarInt(w, pver, uint64(len(msg.Transactions)))
+	err = WriteVarInt(w, pver, uint64(len(msg.Transactions))) //表示交易数量的整数值
 	if err != nil {
 		return err
 	}
 
+	//交易列表
 	for _, tx := range msg.Transactions {
 		err = tx.BtcEncode(w, pver, enc)
 		if err != nil {

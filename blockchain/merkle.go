@@ -1,6 +1,7 @@
 // Copyright (c) 2013-2016 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 实现了构建Merkle树的算法
 
 package blockchain
 

@@ -30,3 +30,4 @@ $ go get -u github.com/btcsuite/btcd/blockchain/indexers
 
 Package indexers is licensed under the [copyfree](http://copyfree.org) ISC
 License.
+实现了transaction到block之间和transaction到关联的bitcoin地址之间的索引关系;

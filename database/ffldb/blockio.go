@@ -106,14 +106,17 @@ type writeCursor struct {
 type blockStore struct {
 	// network is the specific network to use in the flat files for each
 	// block.
+	//当前Block网络类型，比如MainNet、TestNet或SimNet，在向文件中写入区块时会指定该区块来自哪类网络
 	network wire.BitcoinNet
 
 	// basePath is the base path used for the flat block files and metadata.
+	// 存储Block的文件在磁盘上的存储路径
 	basePath string
 
 	// maxBlockFileSize is the maximum size for each file used to store
 	// blocks.  It is defined on the store so the whitebox tests can
 	// override the value.
+	// 存储Block文件的最大的Size
 	maxBlockFileSize uint32
 
 	// The following fields are related to the flat files which hold the
@@ -158,15 +161,15 @@ type blockStore struct {
 	//
 	// Due to the high performance and multi-read concurrency requirements,
 	// write locks should only be held for the minimum time necessary.
-	obfMutex         sync.RWMutex
-	lruMutex         sync.Mutex
-	openBlocksLRU    *list.List // Contains uint32 block file numbers.
-	fileNumToLRUElem map[uint32]*list.Element
-	openBlockFiles   map[uint32]*lockableFile
+	obfMutex         sync.RWMutex             //对openBlockFiles进行保护的读写锁
+	lruMutex         sync.Mutex               //对openBlocksLRU和fileNumToLRUElem进行保护的互斥锁
+	openBlocksLRU    *list.List               // Contains uint32 block file numbers. 已打开文件的序号的LRU列表，默认的最大打开文件数是25
+	fileNumToLRUElem map[uint32]*list.Element //记录文件序号与openBlocksLRU中元素的对应关系
+	openBlockFiles   map[uint32]*lockableFile //记录所有打开的只读文件的序号与文件指针的对应关系
 
 	// writeCursor houses the state for the current file and location that
 	// new blocks are written to.
-	writeCursor *writeCursor
+	writeCursor *writeCursor //指向当前写入的文件，记录其文件序号和写偏移
 
 	// These functions are set to openFile, openWriteFile, and deleteFile by
 	// default, but are exposed here to allow the whitebox tests to replace
@@ -252,7 +255,7 @@ func (s *blockStore) openWriteFile(fileNum uint32) (filer, error) {
 func (s *blockStore) openFile(fileNum uint32) (*lockableFile, error) {
 	// Open the appropriate file as read-only.
 	filePath := blockFilePath(s.basePath, fileNum)
-	file, err := os.Open(filePath)
+	file, err := os.Open(filePath) //通过os.Open()调用以只读模式打开目标文件
 	if err != nil {
 		return nil, makeDbErr(database.ErrDriverSpecific, err.Error(),
 			err)
@@ -272,6 +275,8 @@ func (s *blockStore) openFile(fileNum uint32) (*lockableFile, error) {
 	// therefore should be closed last.
 	s.lruMutex.Lock()
 	lruList := s.openBlocksLRU
+	// 检测openBlocksLRU是否已满，如果已满，则将列表末尾元素移除，同时将对应的文件关闭并从openBlockFiles将其移除，
+	// 然后将新打开的文件添加了列表首位置；其中对openBlocksLRU和fileNumToLRUElem的访问均在s.lruMutex保护下
 	if lruList.Len() >= maxOpenFiles {
 		lruFileNum := lruList.Remove(lruList.Back()).(uint32)
 		oldBlockFile := s.openBlockFiles[lruFileNum]
@@ -290,7 +295,7 @@ func (s *blockStore) openFile(fileNum uint32) (*lockableFile, error) {
 	s.lruMutex.Unlock()
 
 	// Store a reference to it in the open block files map.
-	s.openBlockFiles[fileNum] = blockFile
+	s.openBlockFiles[fileNum] = blockFile //将新打开的文件放入openBlockFiles中
 
 	return blockFile, nil
 }
@@ -321,6 +326,7 @@ func (s *blockStore) blockFile(fileNum uint32) (*lockableFile, error) {
 	// When the requested block file is open for writes, return it.
 	wc := s.writeCursor
 	wc.RLock()
+	// 检查要查找的文件是否是writeCursor指向的文件，如果是则直接返回
 	if fileNum == wc.curFileNum && wc.curFile.file != nil {
 		obf := wc.curFile
 		obf.RLock()
@@ -330,6 +336,7 @@ func (s *blockStore) blockFile(fileNum uint32) (*lockableFile, error) {
 	wc.RUnlock()
 
 	// Try to return an open file under the overall files read lock.
+	// 从blockStore记录的openBlockFiles中查找文件，如果找到，将文件移至LRU列表的首位置，同时获得文件读锁后返回
 	s.obfMutex.RLock()
 	if obf, ok := s.openBlockFiles[fileNum]; ok {
 		s.lruMutex.Lock()
@@ -345,6 +352,11 @@ func (s *blockStore) blockFile(fileNum uint32) (*lockableFile, error) {
 	// Since the file isn't open already, need to check the open block files
 	// map again under write lock in case multiple readers got here and a
 	// separate one is already opening the file.
+	// 获取s.obfMutex的写锁并再次从openBlockFiles中查找文件，这是为了防止刚刚从openBlockFiles查找完成后，
+	// 目标文件被其他线程打开并添加到openBlockFiles中了，如果不作此保护，在openBlockFiles中未找到就打开新文件，
+	// 可能出现同一个文件被多次打开的情况。有读者可能会想到: 为什么不在第一次查找openBlockFiles就通过s.obfMutex的写锁保护呢？
+	// 这里也为了提高对openBlockFiles的读写并发，openBlockFiles存的均是最近打开过的文件，有较大概率在第一次查找openBlockFiles就能找到目标文件，
+	// 通过s.obfMutex的读锁保护，能提高从openBlockFiles查找的并发量
 	s.obfMutex.Lock()
 	if obf, ok := s.openBlockFiles[fileNum]; ok {
 		obf.RLock()
@@ -509,13 +521,13 @@ func (s *blockStore) readBlock(hash *chainhash.Hash, loc blockLocation) ([]byte,
 	// Get the referenced block file handle opening the file as needed.  The
 	// function also handles closing files as needed to avoid going over the
 	// max allowed open files.
-	blockFile, err := s.blockFile(loc.blockFileNum)
+	blockFile, err := s.blockFile(loc.blockFileNum) //查询已经打开的文件或者新打开一个文件
 	if err != nil {
 		return nil, err
 	}
 
 	serializedData := make([]byte, loc.blockLen)
-	n, err := blockFile.file.ReadAt(serializedData, int64(loc.fileOffset))
+	n, err := blockFile.file.ReadAt(serializedData, int64(loc.fileOffset)) //从文件中的loc.fileOffset位置读出区块数据，它的格式是“<network><block length><serialized block><checksum>”
 	blockFile.RUnlock()
 	if err != nil {
 		str := fmt.Sprintf("failed to read block %s from file %d, "+

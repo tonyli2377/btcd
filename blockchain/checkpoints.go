@@ -1,6 +1,8 @@
 // Copyright (c) 2013-2016 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 实现了BlockChain中与Checkpoint相关的方法，如findPreviousCheckpoint()等等，BlockChain中的checkpoints是一系列指定的区块，
+// 内置在bitcoin节点中，用于验证区块工作量;
 
 package blockchain
 

@@ -8,9 +8,8 @@ import (
 	"bytes"
 	"container/list"
 	"fmt"
-	"sync"
-
 	"github.com/btcsuite/btcd/wire"
+	"sync"
 )
 
 // mruInventoryMap provides a concurrency safe map that is limited to a maximum
@@ -57,9 +56,8 @@ func (m *mruInventoryMap) Exists(iv *wire.InvVect) bool {
 }
 
 // Add adds the passed inventory to the map and handles eviction of the oldest
-// item if adding the new item would exceed the max limit.  Adding an existing
+// item if adding the new item would exceed the max limit. Adding an existing
 // item makes it the most recently used item.
-//
 // This function is safe for concurrent access.
 func (m *mruInventoryMap) Add(iv *wire.InvVect) {
 	m.invMtx.Lock()

@@ -2,6 +2,7 @@
 // Copyright (c) 2015-2018 The Decred developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
+// 定义了BlockChain类型，区块加入区块链，或者区块链构建的主要实现过程
 
 package blockchain
 
@@ -39,6 +40,11 @@ const (
 //
 // The block locator for block 17a would be the hashes of blocks:
 // [17a 16a 15 14 13 12 11 10 9 8 7 6 4 genesis]
+// 用于记录一组block的hash值，slice中的第一个元素即BlockLocator指向的区块
+// 由于区块链可能分叉，为了指明该区块的位置，BlockLocator记录了从指定区块往创世区块回溯的路径:
+// BlockLocator中的前10个hash值是指定区块及其后(区块高度更小)的9个区块的hash值，它们之间的步长为1，
+// 第11个元素后步长成级数增加，即每一次向前回溯时，步长翻倍，使之加快回溯到创世区块，保证了BlockLocator中元素不至于过多。
+// 总之，BlockLocator记录slice中第一个元素代表的区块的位置
 type BlockLocator []*chainhash.Hash
 
 // orphanBlock represents a block that we don't yet have the parent for.  It
@@ -93,26 +99,39 @@ type BlockChain struct {
 	// The following fields are set when the instance is created and can't
 	// be changed afterwards, so there is no need to protect them with a
 	// separate mutex.
+	// 链上预设的一些checkpoints，节点启动时指定，实际由链上的某些高度上的区块充当;
+	// 检测点，是用于保护网络不受全网51%算力攻击，因为攻击者是不能逆转最后一个检测点前发生的那些交易的。
+	// 检测点是通过硬编码方式写入标准客户端的。意味着标准客户端将在检测点之前将接受所有有效交易，这些交易将是不可逆的。
+	// 如果任何人试图在检测点前从一个区块对区块链进行分叉，客户端将不会接受这个分叉，这使得那些区块一成不变（set in stone）。
+	// 通过checkpoint可以防范区块链被恶意分叉，保护比特币网络的正常运行。
+	// 可以只需要同步检查点数据，以及最新检查点之后的区块，然后你的链就可以建立起来了，这样的好处就是你不需要同步所有的链上的区块。
+	// 总之你利用这个特性可以简化空间和验证hash的时间
 	checkpoints         []chaincfg.Checkpoint
-	checkpointsByHeight map[int32]*chaincfg.Checkpoint
-	db                  database.DB
-	chainParams         *chaincfg.Params
-	timeSource          MedianTimeSource
-	sigCache            *txscript.SigCache
-	indexManager        IndexManager
-	hashCache           *txscript.HashCache
+	checkpointsByHeight map[int32]*chaincfg.Checkpoint //记录了checkpoints和对应的区块的高度之间的映射关系，初始化时由checkpoints解析而来
+	db                  database.DB                    //存储区块的database对象
+	// 与区块链相关的参数配置，如网络号、创世区块(Genesis Block)、难度调整周期、DNSSeeds等等；对这些参数进行定制即可以生成一个与Bitcoin类似的新的"代币";
+	chainParams *chaincfg.Params
+	// 用于较正节点时钟的“时钟源”，节点可以在与Peer进行version消息交换的时候把Peer添加到自己的“时钟源”中，
+	// 这样节点通过计算与不同Peer节点的时钟差的中位值，来估计其与网络同步时间的差，
+	// 从而在利用timestamp进行区块较验之前先较正自己的时钟，以防节点时钟未同步造成较验失败
+	timeSource MedianTimeSource
+	// 用于缓存公钥与签名验证的结果，对于已经通过解锁脚本和锁定脚本验证的交易，对应的公钥和签名会被缓存，
+	// 后续相同的交易验证时可以直接从缓存中读到验证结果
+	sigCache     *txscript.SigCache
+	indexManager IndexManager //用于索引链上transaction或者block的indexer
+	hashCache    *txscript.HashCache
 
 	// The following fields are calculated based upon the provided chain
 	// parameters.  They are also set when the instance is created and
 	// can't be changed afterwards, so there is no need to protect them with
 	// a separate mutex.
-	minRetargetTimespan int64 // target timespan / adjustment factor
-	maxRetargetTimespan int64 // target timespan * adjustment factor
-	blocksPerRetarget   int32 // target timespan / target time per block
+	minRetargetTimespan int64 // target timespan / adjustment factor 难度调整的最小周期，公链上其值为3.5天
+	maxRetargetTimespan int64 // target timespan * adjustment factor 难度调整的最大周期，公链上其值为56天
+	blocksPerRetarget   int32 // target timespan / target time per block 难度调整周期内的区块数，公链上难度调整周期是14天，对应的区块数是2016个
 
 	// chainLock protects concurrent access to the vast majority of the
 	// fields in this struct below this point.
-	chainLock sync.RWMutex
+	chainLock sync.RWMutex //保护访问区块链的读写锁
 
 	// These fields are related to the memory block index.  They both have
 	// their own locks, however they are often also protected by the chain
@@ -123,14 +142,17 @@ type BlockChain struct {
 	//
 	// bestChain tracks the current active chain by making use of an
 	// efficient chain view into the block index.
-	index     *blockIndex
+	index     *blockIndex //指向一个区块索引器，用于索引实例化后内存中的各区块
 	bestChain *chainView
 
 	// These fields are related to handling of orphan blocks.  They are
 	// protected by a combination of the chain lock and the orphan lock.
-	orphanLock   sync.RWMutex
-	orphans      map[chainhash.Hash]*orphanBlock
-	prevOrphans  map[chainhash.Hash][]*orphanBlock
+	orphanLock sync.RWMutex                    //保护“孤儿区块”相关对象的读写锁
+	orphans    map[chainhash.Hash]*orphanBlock //记录“孤儿区块”与其Hash之间的映射
+	//记录“孤儿区块”与其父区块Hash之间的映射，当父区块写入区块链后，
+	// 要检索prevOrphans将对应的区块从“孤儿区块池”从移除并写入区块链
+	prevOrphans map[chainhash.Hash][]*orphanBlock
+	//处于“孤儿”状态时间最长的区块，“孤儿区块池”最多维护100个“孤儿区块”，当超过限制时，开始移除“最老”的“孤儿区块”
 	oldestOrphan *orphanBlock
 
 	// These fields are related to checkpoint handling.  They are protected
@@ -149,8 +171,8 @@ type BlockChain struct {
 	//
 	// In addition, some of the fields are stored in the database so the
 	// chain state can be quickly reconstructed on load.
-	stateLock     sync.RWMutex
-	stateSnapshot *BestState
+	stateLock     sync.RWMutex //保护stateSnapshot的读写锁
+	stateSnapshot *BestState   //主链相关信息的快照
 
 	// The following caches are used to efficiently keep track of the
 	// current deployment threshold state of each rule change deployment.
@@ -166,8 +188,10 @@ type BlockChain struct {
 	//
 	// deploymentCaches caches the current deployment threshold state for
 	// blocks in each of the actively defined deployments.
+	// 缓存区块对于所有可能的部署的thresholdState，用于当节点收到大量新的版本的区块，
+	// 且对应的共识规则在新的区块里已经部署或者即将部署时，发出警告提示，为了兼容新版本的区块，可能需要升级btcd版本
 	warningCaches    []thresholdStateCache
-	deploymentCaches []thresholdStateCache
+	deploymentCaches []thresholdStateCache //缓存区块对于已知的部署提案的thresholdState
 
 	// The following fields are used to determine if certain warnings have
 	// already been shown.
@@ -177,13 +201,15 @@ type BlockChain struct {
 	//
 	// unknownVersionsWarned refers to warnings due to unknown versions
 	// being mined.
-	unknownRulesWarned    bool
+	unknownRulesWarned bool //标识是否已经警告过未知共识规则已经部署或者将被部署
+	// 标识是否已经警告过收到过多未知新版本的区块；当有新版本的区块时，往往有新的共识规则正在部署，
+	// 所以警告未知新版本与未知共识规则部署是相关的
 	unknownVersionsWarned bool
 
 	// The notifications field stores a slice of callbacks to be executed on
 	// certain blockchain events.
 	notificationsLock sync.RWMutex
-	notifications     []NotificationCallback
+	notifications     []NotificationCallback //向bockchain注册的回调事件接收者
 }
 
 // HaveBlock returns whether or not the chain instance has the block represented
@@ -207,7 +233,6 @@ func (b *BlockChain) HaveBlock(hash *chainhash.Hash) (bool, error) {
 // ProcessBlock with an orphan that already exists results in an error, so this
 // function provides a mechanism for a caller to intelligently detect *recent*
 // duplicate orphans and react accordingly.
-//
 // This function is safe for concurrent access.
 func (b *BlockChain) IsKnownOrphan(hash *chainhash.Hash) bool {
 	// Protect concurrent access.  Using a read lock only so multiple

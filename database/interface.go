@@ -5,6 +5,8 @@
 // Parts of this interface were inspired heavily by the excellent boltdb project
 // at https://github.com/boltdb/bolt by Ben B. Johnson.
 
+//定义了DB、Bucket、Tx、Cursor等接口，几乎与BoltDB中的定义一致
+
 package database
 
 import (
@@ -213,6 +215,8 @@ type BlockRegion struct {
 // long running operations.
 type Tx interface {
 	// Metadata returns the top-most bucket for all metadata storage.
+	// 通过Metadata()可以获得根Bucket，所有的元数据均归属于Bucket，Bucket及其中的K/V对最终存于leveldb中。
+	// 在一个Transaction中，对元数据的操作均是通过Metadata()得到Bucket后，再在Bucket中进行操作的;
 	Metadata() Bucket
 
 	// StoreBlock stores the provided block into the database.  There are no
@@ -400,11 +404,13 @@ type Tx interface {
 	// are started after the commit finishes will include all changes made
 	// by this transaction.  Calling this function on a managed transaction
 	// will result in a panic.
+	// 在可写Tx中写元数据或者区块后，均需要通过Commit()来提交修改并关闭Tx，或者通过Rollback来丢弃修改或关闭
 	Commit() error
 
 	// Rollback undoes all changes that have been made to the metadata or
 	// block storage.  Calling this function on a managed transaction will
 	// result in a panic.
+	// 在可写Tx中写元数据或者区块后，均需要通过Commit()来提交修改并关闭Tx，或者通过Rollback来丢弃修改或关闭
 	Rollback() error
 }
 
