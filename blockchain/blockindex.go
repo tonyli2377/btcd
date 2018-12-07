@@ -64,6 +64,7 @@ func (status blockStatus) KnownInvalid() bool {
 // blockNode represents a block within the block chain and is primarily used to
 // aid in selecting the best chain to be the main chain.  The main chain is
 // stored into the block database.
+// blockNode可以看作是区块在内存中的实例化类型
 type blockNode struct {
 	// NOTE: Additions, deletions, or modifications to the order of the
 	// definitions in this struct should not be changed without considering
@@ -71,29 +72,32 @@ type blockNode struct {
 	// specifically crafted to result in minimal padding.  There will be
 	// hundreds of thousands of these in memory, so a few extra bytes of
 	// padding adds up.
-
 	// parent is the parent block for this node.
-	parent *blockNode
+	parent *blockNode //指向父区块
 
 	// hash is the double sha 256 of the block.
+	// 区块的Hash，指区块头的双Hash
+	// 请注意，区块头中只包含父区块的头Hash，而不包含自身的头Hash
 	hash chainhash.Hash
 
 	// workSum is the total amount of work in the chain up to and including
 	// this node.
+	// 从该区块到创世区块的工作量之和
 	workSum *big.Int
 
 	// height is the position in the block chain.
+	// 区块高度
 	height int32
 
 	// Some fields from block headers to aid in best chain selection and
 	// reconstructing headers from memory.  These must be treated as
 	// immutable and are intentionally ordered to avoid padding on 64-bit
 	// platforms.
-	version    int32
-	bits       uint32
-	nonce      uint32
-	timestamp  int64
-	merkleRoot chainhash.Hash
+	version    int32          //对应于区块头中的区块版本号
+	bits       uint32         //当对应于区块头中的前目标的Hash值
+	nonce      uint32         //对应于区块头中的nonce
+	timestamp  int64          //对应于区块头中的时间戳
+	merkleRoot chainhash.Hash //对应于区块头中的merkleRoot
 
 	// status is a bitfield representing the validation state of the block. The
 	// status field, unlike the other fields, may be written to and so should

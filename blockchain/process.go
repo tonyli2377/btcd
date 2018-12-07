@@ -81,12 +81,18 @@ func (b *BlockChain) blockExists(hash *chainhash.Hash) (bool, error) {
 // are needed to pass along to maybeAcceptBlock.
 //
 // This function MUST be called with the chain state lock held (for writes).
+// 对“孤儿”区块进行处理
+// processOrphans()的输入参数hash是刚刚添加到区块链上的区块的Hash，而不是“孤儿”区块的Hash
 func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) error {
 	// Start with processing at least the passed hash.  Leave a little room
 	// for additional orphan blocks that need to be processed without
 	// needing to grow the array in the common case.
 	processHashes := make([]*chainhash.Hash, 0, 10)
-	processHashes = append(processHashes, hash)
+	processHashes = append(processHashes, hash) //定义一个临时的slice processHashes，用于缓存刚刚添加到区块链上的区块Hash
+
+	// 循环处理所有刚刚添加到区块链上的区块为父区块的“孤儿”
+	// 首先，从processHashes中取出首元素，并将首元素从processHashes中移除，类似栈的pop操作
+	// 这里采用for循环处理processHashes直到其为空，而没有采用range操作，是由于processHashes中元素个数会在循环体中修改
 	for len(processHashes) > 0 {
 		// Pop the first hash to process from the slice.
 		processHash := processHashes[0]
@@ -101,6 +107,8 @@ func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) e
 		// intentionally used over a range here as range does not
 		// reevaluate the slice on each iteration nor does it adjust the
 		// index for the modified slice.
+		// 如果父区块有“孤儿”，则循环处理所有“孤儿”
+		// 在处理“孤儿”区块时，首先将其从“孤儿池”中移除，接着调用maybeAcceptBlock()将其加入到区块链上
 		for i := 0; i < len(b.prevOrphans[*processHash]); i++ {
 			orphan := b.prevOrphans[*processHash][i]
 			if orphan == nil {
@@ -124,6 +132,8 @@ func (b *BlockChain) processOrphans(hash *chainhash.Hash, flags BehaviorFlags) e
 			// Add this block to the list of blocks to process so
 			// any orphan blocks that depend on this block are
 			// handled too.
+			// 如果“孤儿”区块正确加入区块链，则将其添加到processHashes中，继续检查是否还有以它为父区块的“孤儿”，
+			// 若有，则重复上述过程，直到新添加到区块链中的区块没有“孤儿”子区块为止
 			processHashes = append(processHashes, orphanHash)
 		}
 	}

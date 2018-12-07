@@ -235,6 +235,7 @@ func (b *BlockChain) calcNextRequiredDifficulty(lastNode *blockNode, newBlockTim
 
 	// Return the previous block's difficulty requirements if this block
 	// is not at a difficulty retarget interval.
+	// 如果待加入区块的高度在一个调整周期(2016个区块)内，则期望的难度值就是父区块的难度值，即不需要调整难度值
 	if (lastNode.height+1)%b.blocksPerRetarget != 0 {
 		// For networks that support it, allow special reduction of the
 		// required difficulty once too much time has elapsed without
@@ -269,6 +270,8 @@ func (b *BlockChain) calcNextRequiredDifficulty(lastNode *blockNode, newBlockTim
 
 	// Limit the amount of adjustment that can occur to the previous
 	// difficulty.
+	// 计算上一次调整周期内经过的时间差，即周期内最后一个区块与起始区块的时间戳的差值，其值的有效范围为3.5天到56天，
+	// 如果限过这一范围，则取其上限或下限
 	actualTimespan := lastNode.timestamp - firstNode.timestamp
 	adjustedTimespan := actualTimespan
 	if actualTimespan < b.minRetargetTimespan {
@@ -282,12 +285,16 @@ func (b *BlockChain) calcNextRequiredDifficulty(lastNode *blockNode, newBlockTim
 	// The result uses integer division which means it will be slightly
 	// rounded down.  Bitcoind also uses integer division to calculate this
 	// result.
+	//计算新的难度值
+	// 其中targetTimespan是14天(在chaincfg/params.go里设置的)，当上一次调整周期(即currentTimespan)超过14天时，说明“出块”速度变慢，要降低难度值；
+	// 当currentTimespan小于14天时，说明“出块”速度过快，要增加难度值。可以看出，困难调整算法就是为了稳定“出块”速度
 	oldTarget := CompactToBig(lastNode.bits)
 	newTarget := new(big.Int).Mul(oldTarget, big.NewInt(adjustedTimespan))
 	targetTimeSpan := int64(b.chainParams.TargetTimespan / time.Second)
 	newTarget.Div(newTarget, big.NewInt(targetTimeSpan))
 
 	// Limit new value to the proof of work limit.
+	// 如果newTarget>b.chainParams.PowLimit, newTarget设置为PowLimit的值
 	if newTarget.Cmp(b.chainParams.PowLimit) > 0 {
 		newTarget.Set(b.chainParams.PowLimit)
 	}
@@ -296,7 +303,7 @@ func (b *BlockChain) calcNextRequiredDifficulty(lastNode *blockNode, newBlockTim
 	// intentionally converting the bits back to a number instead of using
 	// newTarget since conversion to the compact representation loses
 	// precision.
-	newTargetBits := BigToCompact(newTarget)
+	newTargetBits := BigToCompact(newTarget) //将目标难度值编码为难度Bits
 	log.Debugf("Difficulty retarget at block height %d", lastNode.height+1)
 	log.Debugf("Old target %08x (%064x)", lastNode.bits, oldTarget)
 	log.Debugf("New target %08x (%064x)", newTargetBits, CompactToBig(newTargetBits))

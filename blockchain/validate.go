@@ -118,14 +118,21 @@ func IsCoinBase(tx *btcutil.Tx) bool {
 // SequenceLockActive determines if a transaction's sequence locks have been
 // met, meaning that all the inputs of a given transaction have reached a
 // height or time sufficient for their relative lock-time maturity.
-func SequenceLockActive(sequenceLock *SequenceLock, blockHeight int32,
-	medianTimePast time.Time) bool {
-
+// 只有当交易的“绝对解锁时间”和“绝对解锁高度”均小于当前区块的MTP和高度时，交易的“sequence lock”才算“解锁”，
+// 也就表明，交易输入花费的所有交易均满足了一定“成熟度”要求。如果SequenceLock中的高度和时间均为-1，
+// 则表明交易可以被打包进任何区块中。值得注意的是，与交易中的LockTime不同，LockTime是直接指定了交易能被打包的最小时间或高度，
+// 而交易输入中的Sequence代表的“相对锁定时间”或“相对锁定高度”指定了交易花费的其它交易必须满足的“解锁”时间或高度。
+// 例如，如果LockTime值为10000，则交易只能被打包进10001及以后的区块中，如果该交易的输入交易所在的区块高度为9999，
+// 且Sequence指定的相对高度为100，则该交易只能被打包进10098及以后的区块中。
+// 回顾我们之前的分析，checkBlockContext()中调用IsFinalizedTransaction()对交易的LockTime进行了检查，
+// 在checkConnectBlock()中如果BIP68已经部署，又通过SequenceLockActive()对交易输入的Sequnece表示的“相对锁定时间”
+// 或“相对锁定高度”进行了检查，这是为了兼容两种锁定时间
+func SequenceLockActive(sequenceLock *SequenceLock, blockHeight int32, medianTimePast time.Time) bool {
 	// If either the seconds, or height relative-lock time has not yet
 	// reached, then the transaction is not yet mature according to its
 	// sequence locks.
-	if sequenceLock.Seconds >= medianTimePast.Unix() ||
-		sequenceLock.BlockHeight >= blockHeight {
+	// 只有当交易的“绝对解锁时间”和“绝对解锁高度”均小于当前区块的MTP和高度时，交易的“sequence lock”才算“解锁”
+	if sequenceLock.Seconds >= medianTimePast.Unix() || sequenceLock.BlockHeight >= blockHeight {
 		return false
 	}
 
@@ -203,20 +210,24 @@ func CalcBlockSubsidy(height int32, chainParams *chaincfg.Params) int64 {
 
 // CheckTransactionSanity performs some preliminary checks on a transaction to
 // ensure it is sane.  These checks are context free.
+// CheckTransactionSanity的输入是指向btcutil.Tx的指针类型，而不是*wire.MsgTx类型。btcutil.Tx是wire.MsgTx的封装类型
 func CheckTransactionSanity(tx *btcutil.Tx) error {
 	// A transaction must have at least one input.
 	msgTx := tx.MsgTx()
+	// 交易中至少有一个输入，请注意，coinbase交易也包含一个输入，只不过指向一个无效的utxo
 	if len(msgTx.TxIn) == 0 {
 		return ruleError(ErrNoTxInputs, "transaction has no inputs")
 	}
 
 	// A transaction must have at least one output.
+	// 交易中至少有一个输出
 	if len(msgTx.TxOut) == 0 {
 		return ruleError(ErrNoTxOutputs, "transaction has no outputs")
 	}
 
 	// A transaction must not exceed the maximum allowed block payload when
 	// serialized.
+	// 交易的Size不能超过Block的最大Size，即1000000字节
 	serializedTxSize := tx.MsgTx().SerializeSizeStripped()
 	if serializedTxSize > MaxBlockBaseSize {
 		str := fmt.Sprintf("serialized transaction is too big - got "+
@@ -255,6 +266,7 @@ func CheckTransactionSanity(tx *btcutil.Tx) error {
 				btcutil.MaxSatoshi)
 			return ruleError(ErrBadTxOutValue, str)
 		}
+		// 交易的每个输出的比特币数量和总的输出比特币数量须大于零而且小于2100万个比特币，即不能超过比特币总量
 		if totalSatoshi > btcutil.MaxSatoshi {
 			str := fmt.Sprintf("total value of all transaction "+
 				"outputs is %v which is higher than max "+
@@ -265,6 +277,7 @@ func CheckTransactionSanity(tx *btcutil.Tx) error {
 	}
 
 	// Check for duplicate transaction inputs.
+	// 检查交易中是否有重复的输入
 	existingTxOut := make(map[wire.OutPoint]struct{})
 	for _, txIn := range msgTx.TxIn {
 		if _, exists := existingTxOut[txIn.PreviousOutPoint]; exists {
@@ -275,6 +288,9 @@ func CheckTransactionSanity(tx *btcutil.Tx) error {
 	}
 
 	// Coinbase script length must be between min and max length.
+	// 检查交易输入引用的交易是否正常，如果是Coinbase交易，由于没有有效的输入，所以其解锁脚本可以是“矿工”写入的任意字符串，
+	// 但其编码后的长度应该大于等于2个字节且小于等于100个字节；
+	// 如果不是coinbase交易，则其输入必须指向一个有效的交易的有效输出Utxo，即其Hash是非零Hash且输出的索引号不是0xFFFFFFFF
 	if IsCoinBase(tx) {
 		slen := len(msgTx.TxIn[0].SignatureScript)
 		if slen < MinCoinbaseScriptLen || slen > MaxCoinbaseScriptLen {
@@ -307,6 +323,7 @@ func CheckTransactionSanity(tx *btcutil.Tx) error {
 //    difficulty is not performed.
 func checkProofOfWork(header *wire.BlockHeader, powLimit *big.Int, flags BehaviorFlags) error {
 	// The target difficulty must be larger than zero.
+	// 调用CompactToBig()方法，将区块头中区块目标难度Bits转换成整数值，便于后续进行数值比较
 	target := CompactToBig(header.Bits)
 	if target.Sign() <= 0 {
 		str := fmt.Sprintf("block target difficulty of %064x is too low",
@@ -315,6 +332,7 @@ func checkProofOfWork(header *wire.BlockHeader, powLimit *big.Int, flags Behavio
 	}
 
 	// The target difficulty must be less than the maximum allowed.
+	// 检测难度值是否在(0, 2^224-1)范围内
 	if target.Cmp(powLimit) > 0 {
 		str := fmt.Sprintf("block target difficulty of %064x is "+
 			"higher than max of %064x", target, powLimit)
@@ -326,8 +344,8 @@ func checkProofOfWork(header *wire.BlockHeader, powLimit *big.Int, flags Behavio
 	if flags&BFNoPoWCheck != BFNoPoWCheck {
 		// The block hash must be less than the claimed target.
 		hash := header.BlockHash()
-		hashNum := HashToBig(&hash)
-		if hashNum.Cmp(target) > 0 {
+		hashNum := HashToBig(&hash)  //调用HashToBig()将区块头Hash转换成整数值，并与目标难度值进行比较
+		if hashNum.Cmp(target) > 0 { //如果区块头Hash值大于目标难度值，则表明该区块不满足工作量证明
 			str := fmt.Sprintf("block hash of %064x is higher than "+
 				"expected max of %064x", hashNum, target)
 			return ruleError(ErrHighHash, str)
@@ -428,11 +446,15 @@ func CountP2SHSigOps(tx *btcutil.Tx, isCoinBaseTx bool, utxoView *UtxoViewpoint)
 //
 // The flags do not modify the behavior of this function directly, however they
 // are needed to pass along to checkProofOfWork.
+// 主要是对区块头中的难度值和时间戳进行检查,其中主要步骤为:
+// （1）调用checkProofOfWork进行工作量检查;
+// （2）检查时间戳的精度为1s，从注释中知道，这是Btcd特有的检查过程；在“挖矿”前打包区块时，填入待“挖”区块头里的timestamp字段的时间值也应保证其精度为1s;
+// （3）最后，检查区块头中时间戳是否超过当前时间2小时，请注意，这里的“当前”时间并不是节点上的时钟，而是经过与Peer同步并较正过的时间;
 func checkBlockHeaderSanity(header *wire.BlockHeader, powLimit *big.Int, timeSource MedianTimeSource, flags BehaviorFlags) error {
 	// Ensure the proof of work bits in the block header is in min/max range
 	// and the block hash is less than the target value described by the
 	// bits.
-	err := checkProofOfWork(header, powLimit, flags)
+	err := checkProofOfWork(header, powLimit, flags) //工作量证明的验证
 	if err != nil {
 		return err
 	}
@@ -449,6 +471,7 @@ func checkBlockHeaderSanity(header *wire.BlockHeader, powLimit *big.Int, timeSou
 	}
 
 	// Ensure the block time is not too far in the future.
+	// 检查区块头中时间戳是否超过当前时间2小时，请注意，这里的“当前”时间并不是节点上的时钟，而是经过与Peer同步并较正过的时间
 	maxTimestamp := timeSource.AdjustedTime().Add(time.Second *
 		MaxTimeOffsetSeconds)
 	if header.Timestamp.After(maxTimestamp) {
@@ -465,15 +488,17 @@ func checkBlockHeaderSanity(header *wire.BlockHeader, powLimit *big.Int, timeSou
 //
 // The flags do not modify the behavior of this function directly, however they
 // are needed to pass along to checkBlockHeaderSanity.
+// 对区块结构进行完整性检查，保证在进一步验证之前区块本身是正确的
 func checkBlockSanity(block *btcutil.Block, powLimit *big.Int, timeSource MedianTimeSource, flags BehaviorFlags) error {
 	msgBlock := block.MsgBlock()
 	header := &msgBlock.Header
-	err := checkBlockHeaderSanity(header, powLimit, timeSource, flags)
+	err := checkBlockHeaderSanity(header, powLimit, timeSource, flags) //对区块头结构进行验证
 	if err != nil {
 		return err
 	}
 
 	// A block must have at least one transaction.
+	// 检查区块中的交易, 区块中至少包含一个交易
 	numTx := len(msgBlock.Transactions)
 	if numTx == 0 {
 		return ruleError(ErrNoTransactions, "block does not contain "+
@@ -482,6 +507,8 @@ func checkBlockSanity(block *btcutil.Block, powLimit *big.Int, timeSource Median
 
 	// A block must not have more transactions than the max block payload or
 	// else it is certainly over the weight limit.
+	// 检查区块中交易的总个数是否超限，这里的限制是block的最大长度，即1000000字节，约为1MB
+	// 这是一个比较宽松的限制，更严格的检查在代码499行处进行，即检查区块的总大小不能超过1MB
 	if numTx > MaxBlockBaseSize {
 		str := fmt.Sprintf("block contains too many transactions - "+
 			"got %d, max %d", numTx, MaxBlockBaseSize)
@@ -490,6 +517,7 @@ func checkBlockSanity(block *btcutil.Block, powLimit *big.Int, timeSource Median
 
 	// A block must not exceed the maximum allowed block payload when
 	// serialized.
+	// 检查区块的总大小不能超过1MB
 	serializedSize := msgBlock.SerializeSizeStripped()
 	if serializedSize > MaxBlockBaseSize {
 		str := fmt.Sprintf("serialized block is too big - got %d, "+
@@ -498,6 +526,7 @@ func checkBlockSanity(block *btcutil.Block, powLimit *big.Int, timeSource Median
 	}
 
 	// The first transaction in a block must be a coinbase.
+	// 检查区块中的第1个交易是coinbase交易
 	transactions := block.Transactions()
 	if !IsCoinBase(transactions[0]) {
 		return ruleError(ErrFirstTxNotCoinbase, "first transaction in "+
@@ -505,6 +534,7 @@ func checkBlockSanity(block *btcutil.Block, powLimit *big.Int, timeSource Median
 	}
 
 	// A block must not have more than one coinbase.
+	// 检查区块中有且只有一个coinbase交易
 	for i, tx := range transactions[1:] {
 		if IsCoinBase(tx) {
 			str := fmt.Sprintf("block contains second coinbase at "+
@@ -516,7 +546,7 @@ func checkBlockSanity(block *btcutil.Block, powLimit *big.Int, timeSource Median
 	// Do some preliminary checks on each transaction to ensure they are
 	// sane before continuing.
 	for _, tx := range transactions {
-		err := CheckTransactionSanity(tx)
+		err := CheckTransactionSanity(tx) //对区块中的每个交易作检查
 		if err != nil {
 			return err
 		}
@@ -528,7 +558,9 @@ func checkBlockSanity(block *btcutil.Block, powLimit *big.Int, timeSource Median
 	// checks.  Bitcoind builds the tree here and checks the merkle root
 	// after the following checks, but there is no reason not to check the
 	// merkle root matches here.
-	merkles := BuildMerkleTreeStore(block.Transactions(), false)
+	// 调用BuildMerkleTreeStore()计算区块中交易的Merkle树，随后用计算出来的Merkle树根与区块头中的Merkle树根比较，
+	// 两个值必须一致，如果不一致，交易集合可能被篡改
+	merkles := BuildMerkleTreeStore(block.Transactions(), false) //计算区块中交易的Merkle树
 	calculatedMerkleRoot := merkles[len(merkles)-1]
 	if !header.MerkleRoot.IsEqual(calculatedMerkleRoot) {
 		str := fmt.Sprintf("block merkle root is invalid - block "+
@@ -540,6 +572,7 @@ func checkBlockSanity(block *btcutil.Block, powLimit *big.Int, timeSource Median
 	// Check for duplicate transactions.  This check will be fairly quick
 	// since the transaction hashes are already cached due to building the
 	// merkle tree above.
+	// 检查交易集合中是否有重复的交易，请注意，这里不是检查双重支付
 	existingTxHashes := make(map[chainhash.Hash]struct{})
 	for _, tx := range transactions {
 		hash := tx.Hash()
@@ -553,6 +586,8 @@ func checkBlockSanity(block *btcutil.Block, powLimit *big.Int, timeSource Median
 
 	// The number of signature operations must be less than the maximum
 	// allowed per block.
+	// 检查区块中所有交易的解锁脚本和锁定脚本中的操作符的总数是否超过限制，当前每个区块中的脚本操作符总个数限制为80000个，
+	// 超过限制的区块有可能包含恶意脚本来消耗节点计算资源
 	totalSigOps := 0
 	for _, tx := range transactions {
 		// We could potentially overflow the accumulator so check for
@@ -642,14 +677,16 @@ func checkSerializedHeight(coinbaseTx *btcutil.Tx, wantHeight int32) error {
 //    the checkpoints are not performed.
 //
 // This function MUST be called with the chain state lock held (for writes).
+// 检查区块头中的难度值、时间戳、高度及版本号是否符号链上的要求
 func (b *BlockChain) checkBlockHeaderContext(header *wire.BlockHeader, prevNode *blockNode, flags BehaviorFlags) error {
 	fastAdd := flags&BFFastAdd == BFFastAdd
 	if !fastAdd {
 		// Ensure the difficulty specified in the block header matches
 		// the calculated difficulty based on the previous block and
 		// difficulty retarget rules.
-		expectedDifficulty, err := b.calcNextRequiredDifficulty(prevNode,
-			header.Timestamp)
+		// 根据难度调整算法计算链上下一个区块预期的目标难度值，并与当前区块头中的难度值进行比较，
+		// 如果区块头中的难度值不符合预期值，则验证失败，这可以防止“矿工”故意选择难度“小”的值
+		expectedDifficulty, err := b.calcNextRequiredDifficulty(prevNode, header.Timestamp)
 		if err != nil {
 			return err
 		}
@@ -662,6 +699,7 @@ func (b *BlockChain) checkBlockHeaderContext(header *wire.BlockHeader, prevNode 
 
 		// Ensure the timestamp for the block header is after the
 		// median time of the last several blocks (medianTimeBlocks).
+		// 计算链上最后一个区块的MTP，并与当前区块头中的时间戳比较，如果区块头中的时间值小于MTP则验证失败，这保证区块的MTP是单调增长的
 		medianTime := prevNode.CalcPastMedianTime()
 		if !header.Timestamp.After(medianTime) {
 			str := "block timestamp of %v is not after expected %v"
@@ -675,6 +713,8 @@ func (b *BlockChain) checkBlockHeaderContext(header *wire.BlockHeader, prevNode 
 	blockHeight := prevNode.height + 1
 
 	// Ensure chain matches up to predetermined checkpoints.
+	// 验证待加入区块是否对应一个预置的Checkpoint点，如果是，则比较区块Hash是否与预置的Hash值一致，
+	// 如果不一致则验证失败，这保证了Checkpoint点的正确性
 	blockHash := header.BlockHash()
 	if !b.verifyCheckpoint(blockHeight, &blockHash) {
 		str := fmt.Sprintf("block at height %d does not match "+
@@ -686,6 +726,9 @@ func (b *BlockChain) checkBlockHeaderContext(header *wire.BlockHeader, prevNode 
 	// chain before it.  This prevents storage of new, otherwise valid,
 	// blocks which build off of old blocks that are likely at a much easier
 	// difficulty and therefore could be used to waste cache and disk space.
+	// 查找区块链上最近的Checkpoint点，请注意，这里不是查找待加入区块父区块之前的Checkpoint点，
+	// 而是节点上区块链上高度最高的Checkpoint点，如果待加入区块的高度小于最近Checkpoint点的高度，
+	// 即区块试图在Checkpoint点之间进行分叉，则验证失败，因为Checkpoint点之前分叉的侧链很可能因工作量之和小于主链的工作量之和而没有机会成为主链;
 	checkpointNode, err := b.findPreviousCheckpoint()
 	if err != nil {
 		return err
@@ -700,6 +743,9 @@ func (b *BlockChain) checkBlockHeaderContext(header *wire.BlockHeader, prevNode 
 	// Reject outdated block versions once a majority of the network
 	// has upgraded.  These were originally voted on by BIP0034,
 	// BIP0065, and BIP0066.
+	// 检查BIP34、BIP66和BIP65所对应的区块高度和版本号是否达到要求，我们前面提到过，区块高度大于等于227931的区块BIP34应该部署，
+	// 且区块的版本号应该大于1；类似地，BIP66在区块高度大于等于363725的区块中已经部署，要求区块版本号不低于3，
+	// BIP65在区块高度大于等于388381的区块中部署，要求区块版本号不低于4
 	params := b.chainParams
 	if header.Version < 2 && blockHeight >= params.BIP0034Height ||
 		header.Version < 3 && blockHeight >= params.BIP0066Height ||
@@ -724,9 +770,11 @@ func (b *BlockChain) checkBlockHeaderContext(header *wire.BlockHeader, prevNode 
 // for how the flags modify its behavior.
 //
 // This function MUST be called with the chain state lock held (for writes).
+// 根据当前区块和父区块来进行上下文检查
 func (b *BlockChain) checkBlockContext(block *btcutil.Block, prevNode *blockNode, flags BehaviorFlags) error {
 	// Perform all block header related validation checks.
 	header := &block.MsgBlock().Header
+	// 对区块头进行上下文检查，与checkBlockHeaderSanity()不同的是，checkBlockHeaderContext()要检查区块头中的难度值、时间戳等是否满足链上的要求
 	err := b.checkBlockHeaderContext(header, prevNode, flags)
 	if err != nil {
 		return err
@@ -737,6 +785,10 @@ func (b *BlockChain) checkBlockContext(block *btcutil.Block, prevNode *blockNode
 		// Obtain the latest state of the deployed CSV soft-fork in
 		// order to properly guard the new validation behavior based on
 		// the current BIP 9 version bits state.
+		// 调用deploymentState()计算父区块的子区块的CSV(包含BIP68、BIP112和BIP113)部署的状态，也即链上预期的CSV部署状态，
+		// 如果是Active的，则根据BIP[113]的建议，在检查交易的LockTime时用MTP(Median Time Past，
+		// 指前11个区块的timestamp的中位值)而不是区块头中的timestamp来比较，这样做是为了防止“矿工”故意修改区块头中的timestamp，
+		// 将locktime小于正常区块生成时间的交易打包进来，以赚取更多的“小费”
 		csvState, err := b.deploymentState(prevNode, chaincfg.DeploymentCSV)
 		if err != nil {
 			return err
@@ -755,6 +807,14 @@ func (b *BlockChain) checkBlockContext(block *btcutil.Block, prevNode *blockNode
 		blockHeight := prevNode.height + 1
 
 		// Ensure all transactions in the block are finalized.
+		// 调用IsFinalizedTransaction()检查区块中每一个交易是否均Finalized，它是通过比较区块的MTP和交易中的LockTime来确定的:
+		// 当LockTime为区块高度时(LockTime值小于5x10^8)，LockTime值小于区块高度时才被认为是Finalized；
+		// 当LockTime为区块生成时间时，LockTime值要小于区块的MTP(Median Time Past)才被认为是Finalized。也就是说，
+		// 只有交易只能被打包进高度或者MTP大于其LockTime值的区块中。特别地，LockTime为零，
+		// 或者交易所有输入的Sequence均为OxFFFFFFFF时，交易也被认为是Finalized，可以被打包进任何区块中。
+		// 请注意，IsFinalizedTransaction()是直接用交易的LockTime进行比较的，并没有采用[BIP68]中的相对LockTime值，
+		// 后面我们将会看到，在区块最终写入主链且CSV部署状态为Active时，还会根据BIP[68]中的建议计算交易的相对LockTime值，
+		// 它是根据交易的每个输入的Sequence值来计算的，且选择最大值作为交易的LockTime
 		for _, tx := range block.Transactions() {
 			if !IsFinalizedTransaction(tx, blockHeight,
 				blockTime) {
@@ -769,10 +829,17 @@ func (b *BlockChain) checkBlockContext(block *btcutil.Block, prevNode *blockNode
 		// blocks whose version is the serializedHeightVersion or newer
 		// once a majority of the network has upgraded.  This is part of
 		// BIP0034.
+		// 检查区[BIP34]是否应用到区块中，如果区块头中的版本大于2(高度为227835是最后一个版本为1的区块)且区块高度大于227931，
+		// 则按[BIP34]中的描述，检查coinbase中是否包含了正确的区块高度
 		if ShouldHaveSerializedBlockHeight(header) &&
+
+			// 检查区[BIP34]是否应用到区块中，如果区块头中的版本大于2(高度为227835是最后一个版本为1的区块)且区块高度大于227931，
+			// 则按[BIP34]中的描述，检查coinbase中是否包含了正确的区块高度
 			blockHeight >= b.chainParams.BIP0034Height {
 
 			coinbaseTx := block.Transactions()[0]
+
+			// 检查coinbase中的解锁脚本的起始处是否包含了正确的区块高度值
 			err := checkSerializedHeight(coinbaseTx, blockHeight)
 			if err != nil {
 				return err
@@ -874,14 +941,18 @@ func (b *BlockChain) checkBIP0030(node *blockNode, block *btcutil.Block, view *U
 // CheckTransactionSanity function prior to calling this function.
 func CheckTransactionInputs(tx *btcutil.Tx, txHeight int32, utxoView *UtxoViewpoint, chainParams *chaincfg.Params) (int64, error) {
 	// Coinbase transactions have no inputs.
+	// 如果是coinbase交易，则直接返回，因为它没有有效输入
 	if IsCoinBase(tx) {
 		return 0, nil
 	}
 
 	txHash := tx.Hash()
 	var totalSatoshiIn int64
+	// 检查交易的每一项输入
 	for txInIndex, txIn := range tx.MsgTx().TxIn {
 		// Ensure the referenced input transaction is available.
+		// 先从utxoset中查找输入的交易是否存在, 如果交易的输入不在utxoset中，
+		// 则它试图花费一个无效的交易或者一个已经花费的交易，将不能通过验证
 		utxo := utxoView.LookupEntry(txIn.PreviousOutPoint)
 		if utxo == nil || utxo.IsSpent() {
 			str := fmt.Sprintf("output %v referenced from "+
@@ -893,6 +964,9 @@ func CheckTransactionInputs(tx *btcutil.Tx, txHeight int32, utxoView *UtxoViewpo
 
 		// Ensure the transaction is not spending coins which have not
 		// yet reached the required coinbase maturity.
+		// 如果交易花费的是一个coinbase交易，则需要检查该coinbase交易是否已经“成熟”，
+		// 即当前区块的高度减去coinbase生成的区块是否大于设定的CoinbaseMaturity值，
+		// 当前该值为100，也就是说，coinbase交易至少要有100个确认后才能被花费
 		if utxo.IsCoinBase() {
 			originHeight := utxo.BlockHeight()
 			blocksSincePrev := txHeight - originHeight
@@ -914,6 +988,7 @@ func CheckTransactionInputs(tx *btcutil.Tx, txHeight int32, utxoView *UtxoViewpo
 		// a transaction are in a unit value known as a satoshi.  One
 		// bitcoin is a quantity of satoshi as defined by the
 		// SatoshiPerBitcoin constant.
+		// 检查交易花费的utxo的输出币值是否在0 ~ 2100万BTC之间
 		originTxSatoshi := utxo.Amount()
 		if originTxSatoshi < 0 {
 			str := fmt.Sprintf("transaction output has negative "+
@@ -931,6 +1006,7 @@ func CheckTransactionInputs(tx *btcutil.Tx, txHeight int32, utxoView *UtxoViewpo
 		// The total of all outputs must not be more than the max
 		// allowed per transaction.  Also, we could potentially overflow
 		// the accumulator so check for overflow.
+		// 检查交易花费的所有utxo的币值总和不超过2100万BTC
 		lastSatoshiIn := totalSatoshiIn
 		totalSatoshiIn += originTxSatoshi
 		if totalSatoshiIn < lastSatoshiIn ||
@@ -946,6 +1022,7 @@ func CheckTransactionInputs(tx *btcutil.Tx, txHeight int32, utxoView *UtxoViewpo
 	// Calculate the total output amount for this transaction.  It is safe
 	// to ignore overflow and out of range errors here because those error
 	// conditions would have already been caught by checkTransactionSanity.
+	// 计算交易的所有输出的币值总和，它不能大于所花费的utxo币值总和
 	var totalSatoshiOut int64
 	for _, txOut := range tx.MsgTx().TxOut {
 		totalSatoshiOut += txOut.Value
@@ -962,6 +1039,7 @@ func CheckTransactionInputs(tx *btcutil.Tx, txHeight int32, utxoView *UtxoViewpo
 	// NOTE: bitcoind checks if the transaction fees are < 0 here, but that
 	// is an impossible condition because of the check above that ensures
 	// the inputs are >= the outputs.
+	// 计算交易的总输入币值与总输出币值的差得到交易的费用，费用应该等或者大于零
 	txFeeInSatoshi := totalSatoshiIn - totalSatoshiOut
 	return txFeeInSatoshi, nil
 }
@@ -987,6 +1065,8 @@ func CheckTransactionInputs(tx *btcutil.Tx, txHeight int32, utxoView *UtxoViewpo
 // with that node.
 //
 // This function MUST be called with the chain state lock held (for writes).
+// checkConnectBlock()是区块加入主链前最后也是最复杂的检查过程，其主要过程：
+// （1）根据BIP30的建议，检查区块中的交易是否与主链上的交易重复。
 func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, view *UtxoViewpoint, stxos *[]SpentTxOut) error {
 	// If the side chain blocks end up in the database, a call to
 	// CheckBlockSanity should be done here in case a previous version
@@ -1025,6 +1105,11 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// BIP0034 is not yet active.  This is a useful optimization because the
 	// BIP0030 check is expensive since it involves a ton of cache misses in
 	// the utxoset.
+	// 根据BIP30的建议，检查区块中的交易是否与主链上的交易重复。交易是通过交易的Hash来标识的，
+	// 那么有相同Hash值的交易就是重复的交易。
+	// 对区块高度小于227931且除高度为91842和91880以外的区块进行BIP30检查。高度大于227931的区块已经部署BIP34，
+	// 即coibase的锁定脚本中包含了区块高度值，使得coinbase的Hash冲突的可能性变小，故不再做BIP30检查。
+	// BIP0030: 只有当区块中的所有交易不在utxoset中或者对应的utxoentry的所有output均已经花费掉，才算通过检查
 	if !isBIP0030Node(node) && (node.height < b.chainParams.BIP0034Height) {
 		err := b.checkBIP0030(node, block, view)
 		if err != nil {
@@ -1037,6 +1122,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	//
 	// These utxo entries are needed for verification of things such as
 	// transaction inputs, counting pay-to-script-hashes, and scripts.
+	// 调用UtxoViewpoint的fetchInputUtxos()将区块中所有交易的输入引用的utxo从db中加载到内存中
 	err := view.fetchInputUtxos(b.db, block)
 	if err != nil {
 		return err
@@ -1046,6 +1132,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// "standard" type.  The rules for this BIP only apply to transactions
 	// after the timestamp defined by txscript.Bip16Activation.  See
 	// https://en.bitcoin.it/wiki/BIP_0016 for more details.
+	// 判断区块是否已经支持P2SH(Pay to Script Hash)。BIP16定义了P2SH，它是一种交易脚本类型
 	enforceBIP0016 := node.timestamp >= txscript.Bip16Activation.Unix()
 
 	// Query for the Version Bits state for the segwit soft-fork
@@ -1082,6 +1169,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		// this on every loop iteration to avoid overflow.
 		lastSigOpCost := totalSigOpCost
 		totalSigOpCost += sigOpCost
+		// 计算区块中所有交易脚本中的操作符的个数,并检查总的个数是否超过限制
 		if totalSigOpCost < lastSigOpCost || totalSigOpCost > MaxBlockSigOpsCost {
 			str := fmt.Sprintf("block contains too many "+
 				"signature operations - got %v, max %v",
@@ -1099,8 +1187,8 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// bounds.
 	var totalFees int64
 	for _, tx := range transactions {
-		txFee, err := CheckTransactionInputs(tx, node.height, view,
-			b.chainParams)
+		// 检查双重支付，交易的输出额是否超过输入额以及coinbase交易能否被花费等, 并计算交易的费用
+		txFee, err := CheckTransactionInputs(tx, node.height, view, b.chainParams)
 		if err != nil {
 			return err
 		}
@@ -1118,6 +1206,9 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		// provably unspendable as available utxos.  Also, the passed
 		// spent txos slice is updated to contain an entry for each
 		// spent txout in the order each transaction spends them.
+		// 将交易中的输入utxo标记为已花费，并更新传入的slice stxos，同时，将交易的输出添加到utxoset中
+		// 值得注意的是，此时spentTxOutputs和utxoset中已经花费的utxoentry还没有最终更新，
+		// 需要等到connectBlock()将区块最终连入主链时更新并将最新状态写入数据库
 		err = view.connectTransaction(tx, node.height, stxos)
 		if err != nil {
 			return err
@@ -1133,8 +1224,11 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	for _, txOut := range transactions[0].MsgTx().TxOut {
 		totalSatoshiOut += txOut.Value
 	}
-	expectedSatoshiOut := CalcBlockSubsidy(node.height, b.chainParams) +
-		totalFees
+
+	// 检查coinbase交易的输出总值是否超过预期值，防止“矿工”随意伪造奖励。coinbase交易的输出即是对“矿工”“挖矿”的奖励，
+	// 预期值包含“挖矿”的“补贴”和区块中所有交易的“费用”之和，其中“补贴”值约4年减半，
+	// 初始值约为50 BTC，现在约“挖矿”的“补贴”约为12.5 BTC。
+	expectedSatoshiOut := CalcBlockSubsidy(node.height, b.chainParams) + totalFees
 	if totalSatoshiOut > expectedSatoshiOut {
 		str := fmt.Sprintf("coinbase transaction for block pays %v "+
 			"which is more than expected value of %v",
@@ -1148,6 +1242,10 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// will therefore be detected by the next checkpoint).  This is a huge
 	// optimization because running the scripts is the most time consuming
 	// portion of block handling.
+	// 对交易中的脚本进行验证，这是一个相对耗时的操作，如果区块的高度是在预置的最新的Checkpoints之下，那么可以跳过脚本检查，
+	// 将错误发现推迟到下一个Checkpoint检查点。如果交易有任何变化，则会影响区块的Hash，并进而改变下一个Checkpoint区块的Hash，
+	// 使得我们前面在checkBlockHeaderContext()中提到的验证Checkpoint的过程失败。可以看出，
+	// 区块必须有足够多的确认才能成为Checkpoint，当前Btcd版本中，区块必须至少有2016个确认才有可能成为Checkpoint
 	checkpoint := b.LatestCheckpoint()
 	runScripts := true
 	if checkpoint != nil && node.height <= checkpoint.Height {
@@ -1176,6 +1274,10 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 
 	// Enforce CHECKSEQUENCEVERIFY during all block validation checks once
 	// the soft-fork deployment is fully active.
+	// deploymentState()查询CSV的部署状态，如果已经部署，则调用calcSequenceLock()，
+	// 根据BIP[68]中的建议根据交易输入的Sequence值来计算交易的相对LockTime值，
+	// 并通过SequenceLockActive()检查区块的MTP和高度是否已经超过交易的锁定时间和锁定高度，
+	// 如果区块的高度小于交易锁定高度或者区块的MTP小于交易锁定时间，则交易不应该被打包进该区块
 	csvState, err := b.deploymentState(node.parent, chaincfg.DeploymentCSV)
 	if err != nil {
 		return err
@@ -1224,6 +1326,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// transactions are actually allowed to spend the coins by running the
 	// expensive ECDSA signature check scripts.  Doing this last helps
 	// prevent CPU exhaustion attacks.
+	// 如果区块在最新的Checkpoint区块之后，则继续进行脚本较验，这一过程在checkBlockScripts()中实现
 	if runScripts {
 		err := checkBlockScripts(block, view, scriptFlags, b.sigCache,
 			b.hashCache)
@@ -1234,6 +1337,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 
 	// Update the best hash for view to include this block since all of its
 	// transactions have been connected.
+	// 将UtxoViewpoint的观察点更新为当前区块，因为随后该区块的相关状态会最终写入区块链
 	view.SetBestHash(&node.hash)
 
 	return nil

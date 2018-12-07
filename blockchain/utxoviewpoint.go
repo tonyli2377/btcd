@@ -1,7 +1,7 @@
 // Copyright (c) 2015-2016 The btcsuite developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
-// 维护了UTXO的集合，包括有新的transaction时向集合中添加新的UTXO或者移除已经花费的UTXO;
+// 维护了UTXO的集合，包括有新的transaction时向集合中添加新的UTXO或者移除已经花费的UTXO
 
 package blockchain
 
@@ -42,9 +42,9 @@ type UtxoEntry struct {
 	// specifically crafted to result in minimal padding.  There will be a
 	// lot of these in memory, so a few extra bytes of padding adds up.
 
-	amount      int64
-	pkScript    []byte // The public key script for the output.
-	blockHeight int32  // Height of block containing tx.
+	amount      int64  //utxo的输出币值
+	pkScript    []byte // The public key script for the output. 输入的锁定脚本
+	blockHeight int32  // Height of block containing tx. UtxoEntry对应的交易所在的区块的高度
 
 	// packedFlags contains additional info about output such as whether it
 	// is a coinbase, whether it is spent, and whether it has been modified
@@ -119,6 +119,7 @@ func (entry *UtxoEntry) Clone() *UtxoEntry {
 //
 // The unspent outputs are needed by other transactions for things such as
 // script validation and double spend prevention.
+// UtxoViewpoint主要记录了主链上交易的Hash与对应的*UtxoEntry之间的映射集合
 type UtxoViewpoint struct {
 	entries  map[wire.OutPoint]*UtxoEntry
 	bestHash chainhash.Hash
@@ -219,6 +220,7 @@ func (view *UtxoViewpoint) AddTxOuts(tx *btcutil.Tx, blockHeight int32) {
 // view does not contain the required utxos.
 func (view *UtxoViewpoint) connectTransaction(tx *btcutil.Tx, blockHeight int32, stxos *[]SpentTxOut) error {
 	// Coinbase transactions don't have any inputs to spend.
+	// 如果交易是coinbase交易，则不用处理其输入，直接调用AddTxOuts将其输出添加到utxoset中
 	if IsCoinBase(tx) {
 		// Add the transaction's outputs as available utxos.
 		view.AddTxOuts(tx, blockHeight)
@@ -238,6 +240,9 @@ func (view *UtxoViewpoint) connectTransaction(tx *btcutil.Tx, blockHeight int32,
 		}
 
 		// Only create the stxo details if requested.
+		// 如果传入的stxos不是nil，则根据花费的utxo构造spentTxOut，并按照交易的输入的顺序将spentTxOut添加到stxos中。
+		// 可以看出，stxos将会按交易及交易输入的顺序记录区块中交易花费的所有utxo(s)。如果区块因分叉而被从主链上移除，
+		// stxos中的记录将被加回到utxoset中
 		if stxos != nil {
 			// Populate the stxo details using the utxo entry.
 			var stxo = SpentTxOut{
@@ -256,7 +261,7 @@ func (view *UtxoViewpoint) connectTransaction(tx *btcutil.Tx, blockHeight int32,
 	}
 
 	// Add the transaction's outputs as available utxos.
-	view.AddTxOuts(tx, blockHeight)
+	view.AddTxOuts(tx, blockHeight) //将交易的所有输出添加到utxoset中
 	return nil
 }
 
@@ -309,8 +314,10 @@ func (view *UtxoViewpoint) fetchEntryByHash(db database.DB, hash *chainhash.Hash
 // created by the passed block, restoring all utxos the transactions spent by
 // using the provided spent txo information, and setting the best hash for the
 // view to the block before the passed block.
+// disconnectTransactions()主要是将区块中的交易从utxoset中移除，并将交易已经花费的所有spentTxOut重设为unspent
 func (view *UtxoViewpoint) disconnectTransactions(db database.DB, block *btcutil.Block, stxos []SpentTxOut) error {
 	// Sanity check the correct number of stxos are provided.
+	// 首先对区块花费的交易数量作检查，确保从数据库中读到的spentJournal与待处理的区块是对应的
 	if len(stxos) != countSpentOutputs(block) {
 		return AssertError("disconnectTransactions called with bad " +
 			"spent transaction out information")
@@ -321,6 +328,10 @@ func (view *UtxoViewpoint) disconnectTransactions(db database.DB, block *btcutil
 	// can spend from previous ones.
 	stxoIdx := len(stxos) - 1
 	transactions := block.Transactions()
+	// 从最后一个交易开始往前遍历处理区块中的交易，之所以从最后一个开始处理，是因为后面的交易可能花费前面的交易，
+	// 在处理的过程中，要把交易本身从utxoset中移除,同时将已经花费的交易恢复到utxoset中，如果排在前面的交易被后面的交易花费，
+	// 从前向后处理时，前面的交易可能先被从utxoset中移除，处理后面的交易时又被恢复到utxoset中，导致utxoset不正确。
+	// 由于交易按“倒序”访问，处理交易中的输入时也是按“倒序”处理的
 	for txIdx := len(transactions) - 1; txIdx > -1; txIdx-- {
 		tx := transactions[txIdx]
 
@@ -350,6 +361,8 @@ func (view *UtxoViewpoint) disconnectTransactions(db database.DB, block *btcutil
 			}
 
 			prevOut.Index = uint32(txOutIdx)
+
+			// 查询当前交易是否在utxoset中，如果不在，则为其创建一个空的utxoentry，并将其modified状态设为true
 			entry := view.entries[prevOut]
 			if entry == nil {
 				entry = &UtxoEntry{
@@ -372,6 +385,8 @@ func (view *UtxoViewpoint) disconnectTransactions(db database.DB, block *btcutil
 		if isCoinBase {
 			continue
 		}
+
+		// 开始“倒序”处理交易中的输入
 		for txInIdx := len(tx.MsgTx().TxIn) - 1; txInIdx > -1; txInIdx-- {
 			// Ensure the spent txout index is decremented to stay
 			// in sync with the transaction input.
@@ -381,6 +396,10 @@ func (view *UtxoViewpoint) disconnectTransactions(db database.DB, block *btcutil
 			// When there is not already an entry for the referenced
 			// output in the view, it means it was previously spent,
 			// so create a new utxo entry in order to resurrect it.
+			// 查询交易输入引用的utxoentry是否在view.entries中，fetchInputUtxos()已经将区块中交易输入引用的utxoentry加载到UtxoViewpoint中了，
+			// 还会出现查询结果为空的情况吗？如果交易的输出全部被花费，则其对应的utxoentry将被从utxoset中移除，
+			// 加载到UtxoViewpoint中后，view.entries中该记录为nil(请注意，view.entries中该记录，只是其值为nil)。
+			// 所以，当查询为空时，说明引用的交易被完全花费了，这时，为其创建新的utxoentry并添加到utxoset中，即将其恢复到utxoset中
 			originOut := &tx.MsgTx().TxIn[txInIdx].PreviousOutPoint
 			entry := view.entries[*originOut]
 			if entry == nil {
@@ -435,7 +454,7 @@ func (view *UtxoViewpoint) disconnectTransactions(db database.DB, block *btcutil
 
 	// Update the best hash for view to the previous block since all of the
 	// transactions for the current block have been disconnected.
-	view.SetBestHash(&block.MsgBlock().Header.PrevBlock)
+	view.SetBestHash(&block.MsgBlock().Header.PrevBlock) //处理完区块中所有交易后，将UtxoViewpoint的观察点移向父区块
 	return nil
 }
 
@@ -534,7 +553,7 @@ func (view *UtxoViewpoint) fetchInputUtxos(db database.DB, block *btcutil.Block)
 	txInFlight := map[chainhash.Hash]int{}
 	transactions := block.Transactions()
 	for i, tx := range transactions {
-		txInFlight[*tx.Hash()] = i
+		txInFlight[*tx.Hash()] = i //记录所有交易的序号
 	}
 
 	// Loop through all of the transaction inputs (except for the coinbase
@@ -559,21 +578,26 @@ func (view *UtxoViewpoint) fetchInputUtxos(db database.DB, block *btcutil.Block)
 				i >= inFlightIndex {
 
 				originTx := transactions[inFlightIndex]
+				// 遍历除coinbase交易外的其它交易，进而遍历每个交易中的所有输入，
+				// 如果交易花费的是当前区块中排在前面的某一个交易，则将花费的交易加入到utxoset中
 				view.AddTxOuts(originTx, block.Height())
 				continue
 			}
 
 			// Don't request entries that are already in the view
 			// from the database.
+			// 如果交易的输入utxo已经在utxoset中，则继续遍历剩下的交易输入
 			if _, ok := view.entries[txIn.PreviousOutPoint]; ok {
 				continue
 			}
 
+			// 将所有花费的且不在uxtoset中的交易的Hash记录到txNeededSet中，准备在Db中根据Hash查找utxoentry
 			neededSet[txIn.PreviousOutPoint] = struct{}{}
 		}
 	}
 
 	// Request the input utxos from the database.
+	// 调用fetchUtxosMain从数据库中查询uxtoentry，并加载到utxoset中
 	return view.fetchUtxosMain(db, neededSet)
 }
 

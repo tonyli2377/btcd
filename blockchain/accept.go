@@ -22,11 +22,12 @@ import (
 // their documentation for how the flags modify their behavior.
 //
 // This function MUST be called with the chain state lock held (for writes).
+// 将区块添加到区块链上
 func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags) (bool, error) {
 	// The height of this block is one more than the referenced previous
 	// block.
 	prevHash := &block.MsgBlock().Header.PrevBlock
-	prevNode := b.index.LookupNode(prevHash)
+	prevNode := b.index.LookupNode(prevHash) //根据prevHash查找父区块
 	if prevNode == nil {
 		str := fmt.Sprintf("previous block %s is unknown", prevHash)
 		return false, ruleError(ErrPreviousBlockUnknown, str)
@@ -35,11 +36,12 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 		return false, ruleError(ErrInvalidAncestorBlock, str)
 	}
 
-	blockHeight := prevNode.height + 1
+	blockHeight := prevNode.height + 1 //找到父区块后，将当前区块的高度值设为父区块高度加1
 	block.SetHeight(blockHeight)
 
 	// The block must pass all of the validation rules which depend on the
 	// position of the block within the block chain.
+	// 检查区块上下文
 	err := b.checkBlockContext(block, prevNode, flags)
 	if err != nil {
 		return false, err
@@ -54,6 +56,7 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	// expensive connection logic.  It also has some other nice properties
 	// such as making blocks that never become part of the main chain or
 	// blocks that fail to connect available for further analysis.
+	// 对区块验证通过后，将其(wire.MsgBlock)写入数据库(区块文件),请注意，这里区块还没有写入区块链;
 	err = b.db.Update(func(dbTx database.Tx) error {
 		return dbStoreBlock(dbTx, block)
 	})
@@ -65,7 +68,7 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	// if the block ultimately gets connected to the main chain, it starts out
 	// on a side chain.
 	blockHeader := &block.MsgBlock().Header
-	newNode := newBlockNode(blockHeader, prevNode)
+	newNode := newBlockNode(blockHeader, prevNode) //为当前区块创建实例化对象blockNode
 	newNode.status = statusDataStored
 
 	b.index.AddNode(newNode)
@@ -77,7 +80,7 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	// Connect the passed block to the chain while respecting proper chain
 	// selection according to the chain with the most proof of work.  This
 	// also handles validation of the transaction scripts.
-	isMainChain, err := b.connectBestChain(newNode, block, flags)
+	isMainChain, err := b.connectBestChain(newNode, block, flags) //将区块写入区块链
 	if err != nil {
 		return false, err
 	}
@@ -85,6 +88,8 @@ func (b *BlockChain) maybeAcceptBlock(block *btcutil.Block, flags BehaviorFlags)
 	// Notify the caller that the new block was accepted into the block
 	// chain.  The caller would typically want to react by relaying the
 	// inventory to other peers.
+	// 当区块成功写入主链或者侧链后，向blockManager通知NTBlockAccepted事件，
+	// blockManager会向所有Peer节点发送inv或header消息，将新区块通告给Peer(s)
 	b.chainLock.Unlock()
 	b.sendNotification(NTBlockAccepted, block)
 	b.chainLock.Lock()

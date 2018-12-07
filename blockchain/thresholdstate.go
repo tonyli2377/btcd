@@ -298,6 +298,10 @@ func (b *BlockChain) IsDeploymentActive(deploymentID uint32) (bool, error) {
 // AFTER the passed node.
 //
 // This function MUST be called with the chain state lock held (for writes).
+// 计算父区块的子区块的CSV(包含BIP68、BIP112和BIP113)部署的状态，也即链上预期的CSV部署状态，
+// 如果是Active的，则根据BIP[113]的建议，在检查交易的LockTime时用MTP(Median Time Past，
+// 指前11个区块的timestamp的中位值)而不是区块头中的timestamp来比较，这样做是为了防止“矿工”故意修改区块头中的timestamp，
+// 将locktime小于正常区块生成时间的交易打包进来，以赚取更多的“小费”
 func (b *BlockChain) deploymentState(prevNode *blockNode, deploymentID uint32) (ThresholdState, error) {
 	if deploymentID > uint32(len(b.chainParams.Deployments)) {
 		return ThresholdFailed, DeploymentError(deploymentID)

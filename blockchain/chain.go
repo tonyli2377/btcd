@@ -311,8 +311,11 @@ func (b *BlockChain) removeOrphanBlock(orphan *orphanBlock) {
 // It also imposes a maximum limit on the number of outstanding orphan
 // blocks and will remove the oldest received orphan block if the limit is
 // exceeded.
+// 如果新区块的父区块不在区块链中，则调用addOrphanBlock()将其加入到“孤儿”区块池中
 func (b *BlockChain) addOrphanBlock(block *btcutil.Block) {
 	// Remove expired orphan blocks.
+	// 先将超过“生存期”的区块从“孤儿池”b.orphans和b.prevOrphans中移除,“孤儿”的生存期为1个小时，
+	// 即区块加入“孤儿池”满一个小时后就应该被移除；同时，更新“年龄”最大的“孤儿”区块
 	for _, oBlock := range b.orphans {
 		if time.Now().After(oBlock.expiration) {
 			b.removeOrphanBlock(oBlock)
@@ -327,6 +330,7 @@ func (b *BlockChain) addOrphanBlock(block *btcutil.Block) {
 	}
 
 	// Limit orphan blocks to prevent memory exhaustion.
+	// 如果“孤儿”区块数量大于99，则最年长的“孤儿”移除，保证“孤儿池”大小不超过100
 	if len(b.orphans)+1 > maxOrphanBlocks {
 		// Remove the oldest orphan to make room for the new one.
 		b.removeOrphanBlock(b.oldestOrphan)
@@ -341,15 +345,18 @@ func (b *BlockChain) addOrphanBlock(block *btcutil.Block) {
 
 	// Insert the block into the orphan map with an expiration time
 	// 1 hour from now.
+	// 为区块封装orphanBlock对象，可以看到“孤儿”的生存期被设为1个小时
 	expiration := time.Now().Add(time.Hour)
 	oBlock := &orphanBlock{
 		block:      block,
 		expiration: expiration,
 	}
-	b.orphans[*block.Hash()] = oBlock
+	b.orphans[*block.Hash()] = oBlock //将“孤儿”区块添加到“孤儿池”中
 
 	// Add to previous hash lookup index for faster dependency lookups.
 	prevHash := &block.MsgBlock().Header.PrevBlock
+
+	// 将“孤儿”区块添加到b.prevOrphans中，b.prevOrphans以“孤儿”区块父区块Hash为Key记录了同一父区块的所有“孤儿”
 	b.prevOrphans[*prevHash] = append(b.prevOrphans[*prevHash], oBlock)
 }
 
@@ -424,6 +431,7 @@ func (b *BlockChain) calcSequenceLock(node *blockNode, tx *btcutil.Tx, utxoView 
 	// inputs present in the mempool.
 	nextHeight := node.height + 1
 
+	// 按顺序遍历交易的所有输入
 	for txInIndex, txIn := range mTx.TxIn {
 		utxo := utxoView.LookupEntry(txIn.PreviousOutPoint)
 		if utxo == nil {
@@ -437,6 +445,7 @@ func (b *BlockChain) calcSequenceLock(node *blockNode, tx *btcutil.Tx, utxoView 
 		// If the input height is set to the mempool height, then we
 		// assume the transaction makes it into the next block when
 		// evaluating its sequence blocks.
+		// 计算每个输入对应的交易所在的区块高度
 		inputHeight := utxo.BlockHeight()
 		if inputHeight == 0x7fffffff {
 			inputHeight = nextHeight
@@ -446,14 +455,15 @@ func (b *BlockChain) calcSequenceLock(node *blockNode, tx *btcutil.Tx, utxoView 
 		// mask in order to obtain the time lock delta required before
 		// this input can be spent.
 		sequenceNum := txIn.Sequence
+
 		relativeLock := int64(sequenceNum & wire.SequenceLockTimeMask)
 
 		switch {
 		// Relative time locks are disabled for this input, so we can
 		// skip any further calculation.
-		case sequenceNum&wire.SequenceLockTimeDisabled == wire.SequenceLockTimeDisabled:
+		case sequenceNum&wire.SequenceLockTimeDisabled == wire.SequenceLockTimeDisabled: //如果相对锁定时间机制未开启，则不计算该输入的相对锁定时间
 			continue
-		case sequenceNum&wire.SequenceLockTimeIsSeconds == wire.SequenceLockTimeIsSeconds:
+		case sequenceNum&wire.SequenceLockTimeIsSeconds == wire.SequenceLockTimeIsSeconds: //如果Sequence的第22位置位，则将Sequence值解析成相对时间。
 			// This input requires a relative time lock expressed
 			// in seconds before it can be spent.  Therefore, we
 			// need to query for the block prior to the one in
@@ -465,6 +475,8 @@ func (b *BlockChain) calcSequenceLock(node *blockNode, tx *btcutil.Tx, utxoView 
 				prevInputHeight = 0
 			}
 			blockNode := node.Ancestor(prevInputHeight)
+
+			// 计算输入交易所在区块的MTP
 			medianTime := blockNode.CalcPastMedianTime()
 
 			// Time based relative time-locks as defined by BIP 68
@@ -473,10 +485,10 @@ func (b *BlockChain) calcSequenceLock(node *blockNode, tx *btcutil.Tx, utxoView 
 			// proper relative time-lock. We also subtract one from
 			// the relative lock to maintain the original lockTime
 			// semantics.
-			timeLockSeconds := (relativeLock << wire.SequenceLockTimeGranularity) - 1
-			timeLock := medianTime.Unix() + timeLockSeconds
+			timeLockSeconds := (relativeLock << wire.SequenceLockTimeGranularity) - 1 //计算相对时间，以秒为单位
+			timeLock := medianTime.Unix() + timeLockSeconds                           //计算输入对应的“绝对解锁时间”
 			if timeLock > sequenceLock.Seconds {
-				sequenceLock.Seconds = timeLock
+				sequenceLock.Seconds = timeLock //将交易中的所有输入的“绝对解锁时间”的最大值作为交易的解锁时间
 			}
 		default:
 			// The relative lock-time for this input is expressed
@@ -484,9 +496,10 @@ func (b *BlockChain) calcSequenceLock(node *blockNode, tx *btcutil.Tx, utxoView 
 			// the input's height as its converted absolute
 			// lock-time. We subtract one from the relative lock in
 			// order to maintain the original lockTime semantics.
-			blockHeight := inputHeight + int32(relativeLock-1)
+			// 如果Sequence的第22位未置位，则将Sequence值解析成相对高度
+			blockHeight := inputHeight + int32(relativeLock-1) //计算“绝对解锁高度”
 			if blockHeight > sequenceLock.BlockHeight {
-				sequenceLock.BlockHeight = blockHeight
+				sequenceLock.BlockHeight = blockHeight //将交易中的所有输入的“绝对解锁高度”的最大值作为交易的解锁高度
 			}
 		}
 	}
@@ -524,6 +537,11 @@ func LockTimeToSequence(isSeconds bool, locktime uint32) uint32 {
 // This function may modify node statuses in the block index without flushing.
 //
 // This function MUST be called with the chain state lock held (for reads).
+// 首先从侧链的链尾(刚刚加入的区块)向前遍历，直到主链与侧链的分叉点，并将侧链上的所有区块节点按原来的顺序添加到attachNodes中，
+// 这样可以保证这些区块按其先后顺序依次加入主链；接着从主链的链尾向前遍历直到分叉点，
+// 并将访问到的区块节点按相反的顺序添加到detachNodes中，即链尾节点是detachNodes的第一个元素，
+// 这样方便从链尾到分叉点依次从主链上移除。
+// getReorganizeNodes()收集完待移除和待添加的区块节点后，由reorganizeChain()完成侧链变成主链的过程
 func (b *BlockChain) getReorganizeNodes(node *blockNode) (*list.List, *list.List) {
 	attachNodes := list.New()
 	detachNodes := list.New()
@@ -587,6 +605,7 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 	view *UtxoViewpoint, stxos []SpentTxOut) error {
 
 	// Make sure it's extending the end of the best chain.
+	// 保证区块的父区块是主链上的“尾节点”
 	prevHash := &block.MsgBlock().Header.PrevBlock
 	if !prevHash.IsEqual(&b.bestChain.Tip().hash) {
 		return AssertError("connectBlock must be called with a block " +
@@ -594,6 +613,7 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 	}
 
 	// Sanity check the correct number of stxos are provided.
+	// 区块中花费的交易数量要与待记录的spentTxOuts数量一致
 	if len(stxos) != countSpentOutputs(block) {
 		return AssertError("connectBlock called with inconsistent " +
 			"spent transaction out information")
@@ -601,6 +621,8 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 
 	// No warnings about unknown rules or versions until the chain is
 	// current.
+	// 如果有节点未知的软分叉部署在区块中激活(状态为ThresholdActive或ThresholdLockedIn)，则打印告警log；
+	// 同时，统计区块前100个区块中有未知版本号的区块个数，超过50%时，打印告警log，这是为了提示手动升级节点版本
 	if b.isCurrent() {
 		// Warn if any unknown new rules are either about to activate or
 		// have already been activated.
@@ -629,19 +651,21 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 	numTxns := uint64(len(block.MsgBlock().Transactions))
 	blockSize := uint64(block.MsgBlock().SerializeSize())
 	blockWeight := uint64(GetBlockWeight(block))
-	state := newBestState(node, blockSize, blockWeight, numTxns,
-		curTotalTxns+numTxns, node.CalcPastMedianTime())
+
+	// 用新区块的Hash、高度、难度Bits、交易数量、MTP及主链上总的交易数据构造新的主链的BestState
+	state := newBestState(node, blockSize, blockWeight, numTxns, curTotalTxns+numTxns, node.CalcPastMedianTime())
 
 	// Atomically insert info into the database.
 	err = b.db.Update(func(dbTx database.Tx) error {
 		// Update best block state.
-		err := dbPutBestState(dbTx, state, node.workSum)
+		err := dbPutBestState(dbTx, state, node.workSum) //更新数据库，先将主链的新的BestState，随同总的工作量之和更新到键值“chainstate”中
 		if err != nil {
 			return err
 		}
 
 		// Add the block hash and height to the block index which tracks
 		// the main chain.
+		// 将区块的block和高度之间的对应关系分别写入Bucket “hashidx” 和Bucket “heightidx”，它们分别记录区块Hash与高度、区块高度与Hash之间的映射关系
 		err = dbPutBlockIndex(dbTx, block.Hash(), node.height)
 		if err != nil {
 			return err
@@ -650,6 +674,7 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 		// Update the utxo set using the state of the utxo view.  This
 		// entails removing all of the utxos spent and adding the new
 		// ones created by the block.
+		// 更新Bucket “utxoset”，删除已经被花费的utxoentry，增加或者更新新的utxoentry
 		err = dbPutUtxoView(dbTx, view)
 		if err != nil {
 			return err
@@ -657,6 +682,7 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 
 		// Update the transaction spend journal by adding a record for
 		// the block that contains all txos spent by it.
+		// 向Bucket“spendjournal”添加一条记录，它记录区块Hash与区块花费的交易的对应关系
 		err = dbPutSpendJournalEntry(dbTx, block.Hash(), stxos)
 		if err != nil {
 			return err
@@ -665,6 +691,8 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 		// Allow the index manager to call each of the currently active
 		// optional indexes with the block being connected so they can
 		// update themselves accordingly.
+		// 调用与BlockChain关联的IndexManager的ConnectBlock()接口，来更新Indexers中的记录，当前版本中可以启用AddrIndex和TxIndex，
+		// AddrIndex用于索引交易和Bitcoin地址的关系，TxIndex用于索引交易和其所在的区块的关系
 		if b.indexManager != nil {
 			err := b.indexManager.ConnectBlock(dbTx, block, stxos)
 			if err != nil {
@@ -698,6 +726,7 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 	// The caller would typically want to react with actions such as
 	// updating wallets.
 	b.chainLock.Unlock()
+	// 向外发出NTBlockConnected事件通知，mempool将更新交易池中的交易，矿工将停止当前“挖矿”过程并开始“求解”下一个区块
 	b.sendNotification(NTBlockConnected, block)
 	b.chainLock.Lock()
 
@@ -708,8 +737,10 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 // the main (best) chain.
 //
 // This function MUST be called with the chain state lock held (for writes).
+// connectBlock()，它实现将区块最终写入主链；与之对应地，区块最终从主链移除是在disconnectBlock()中实现的
 func (b *BlockChain) disconnectBlock(node *blockNode, block *btcutil.Block, view *UtxoViewpoint) error {
 	// Make sure the node being disconnected is the end of the best chain.
+	// 比较等移除区块的Hash值是否与链尾节点的Hash值相等，保证移除的是主链链尾节点
 	if !node.hash.IsEqual(&b.bestChain.Tip().hash) {
 		return AssertError("disconnectBlock must be called with the " +
 			"block at the end of the main chain")
@@ -747,6 +778,7 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block *btcutil.Block, view
 
 	err = b.db.Update(func(dbTx database.Tx) error {
 		// Update best block state.
+		// 更新数据库中主链状态BestState
 		err := dbPutBestState(dbTx, state, node.workSum)
 		if err != nil {
 			return err
@@ -754,6 +786,7 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block *btcutil.Block, view
 
 		// Remove the block hash and height from the block index which
 		// tracks the main chain.
+		// 将区块记录从Bucket “hashidx”和“heightidx”中移除
 		err = dbRemoveBlockIndex(dbTx, block.Hash(), node.height)
 		if err != nil {
 			return err
@@ -762,6 +795,7 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block *btcutil.Block, view
 		// Update the utxo set using the state of the utxo view.  This
 		// entails restoring all of the utxos spent and removing the new
 		// ones created by the block.
+		// 更新utxoset
 		err = dbPutUtxoView(dbTx, view)
 		if err != nil {
 			return err
@@ -776,6 +810,7 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block *btcutil.Block, view
 
 		// Update the transaction spend journal by removing the record
 		// that contains all txos spent by the block.
+		// 移除区块的spendJournal，从indexer中将区块记录移除
 		err = dbRemoveSpendJournalEntry(dbTx, block.Hash())
 		if err != nil {
 			return err
@@ -817,7 +852,7 @@ func (b *BlockChain) disconnectBlock(node *blockNode, block *btcutil.Block, view
 	// chain.  The caller would typically want to react with actions such as
 	// updating wallets.
 	b.chainLock.Unlock()
-	b.sendNotification(NTBlockDisconnected, block)
+	b.sendNotification(NTBlockDisconnected, block) //向blockManager通知NTBlockDisconnected事件，将区块中的交易重新放回mempool
 	b.chainLock.Lock()
 
 	return nil
@@ -844,6 +879,13 @@ func countSpentOutputs(block *btcutil.Block) int {
 // This function may modify node statuses in the block index without flushing.
 //
 // This function MUST be called with the chain state lock held (for writes).
+// 如果新的区块是扩展了侧链，而且扩展后的侧链的工作量之和大于主链的工作量之和，
+// 那么就需要通过reorganizeChain()将侧链变成主链
+// reorganizeChain()在进行主链切换时分为两个阶段: 一是对切换过程中涉及到的block、transaction及utxoset操作进行验证；
+// 二是进行真正的移除和添加操作。没有选择边检查边移除或者边添加区块的操作，是为了防止中间步骤验证失败导致整个切换过程需要回滚。
+// 这两个阶段分别使用了不同的UtxoViewpoint，所以其中涉及到对utxoset的操作互不影响。在验证或者操作阶段，
+// 均需要访问待移除或者待添加的区块信息和待移除区块的spendJournal，它们可能需要从数据库中读取，
+// 所以getReorganizeNodes()对这些信息进行了缓存。同时，在切换过程中，总是先从主链移除区块，再添加原侧链上的区块。
 func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error {
 	// Nothing to do if no reorganize nodes were provided.
 	if detachNodes.Len() == 0 && attachNodes.Len() == 0 {
@@ -882,6 +924,8 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 	// be loaded from the database during the reorg check phase below and
 	// then they are needed again when doing the actual database updates.
 	// Rather than doing two loads, cache the loaded data into these slices.
+	// 定义并初始化缓存，包括主链上待移除的区块detachBlocks、
+	// 欲添加的侧链上的区块attachBlocks和待移除的区块的spentTxOut集体detachSpentTxOuts
 	detachBlocks := make([]*btcutil.Block, 0, detachNodes.Len())
 	detachSpentTxOuts := make([][]SpentTxOut, 0, detachNodes.Len())
 	attachBlocks := make([]*btcutil.Block, 0, attachNodes.Len())
@@ -890,6 +934,7 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 	// entails loading the blocks and their associated spent txos from the
 	// database and using that information to unspend all of the spent txos
 	// and remove the utxos created by the blocks.
+	// 从及它花费的utxoentry、spentTxouts，并缓存下来
 	view := NewUtxoViewpoint()
 	view.SetBestHash(&oldBest.hash)
 	for e := detachNodes.Front(); e != nil; e = e.Next() {
@@ -897,7 +942,7 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 		var block *btcutil.Block
 		err := b.db.View(func(dbTx database.Tx) error {
 			var err error
-			block, err = dbFetchBlockByNode(dbTx, n)
+			block, err = dbFetchBlockByNode(dbTx, n) //数据库中加载待移除区块
 			return err
 		})
 		if err != nil {
@@ -911,6 +956,7 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 
 		// Load all of the utxos referenced by the block that aren't
 		// already in the view.
+		// 花费的utxoentry
 		err = view.fetchInputUtxos(b.db, block)
 		if err != nil {
 			return err
@@ -920,7 +966,7 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 		// journal.
 		var stxos []SpentTxOut
 		err = b.db.View(func(dbTx database.Tx) error {
-			stxos, err = dbFetchSpendJournalEntry(dbTx, block)
+			stxos, err = dbFetchSpendJournalEntry(dbTx, block) //花费的spentTxouts
 			return err
 		})
 		if err != nil {
@@ -931,6 +977,7 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 		detachBlocks = append(detachBlocks, block)
 		detachSpentTxOuts = append(detachSpentTxOuts, stxos)
 
+		// 调用UtxoViewpoint的disconnectTransactions()对utxoset操作，包括将交易产生的utxo清除和交易花费的txout重新放回utxoset等
 		err = view.disconnectTransactions(b.db, block, stxos)
 		if err != nil {
 			return err
@@ -964,7 +1011,7 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 		var block *btcutil.Block
 		err := b.db.View(func(dbTx database.Tx) error {
 			var err error
-			block, err = dbFetchBlockByNode(dbTx, n)
+			block, err = dbFetchBlockByNode(dbTx, n) //从数据库中加载并实例化等添加的侧链区块，并缓存下来
 			return err
 		})
 		if err != nil {
@@ -999,7 +1046,7 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 		// In the case the block is determined to be invalid due to a
 		// rule violation, mark it as invalid and mark all of its
 		// descendants as having an invalid ancestor.
-		err = b.checkConnectBlock(n, block, view, nil)
+		err = b.checkConnectBlock(n, block, view, nil) //调用checkConnectBlock()对区块连入主链时的各种条件作最后检查
 		if err != nil {
 			if _, ok := err.(RuleError); ok {
 				b.index.SetStatusFlags(n, statusValidateFailed)
@@ -1020,10 +1067,11 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 	// the reorg would be successful and the connection code requires the
 	// view to be valid from the viewpoint of each block being connected or
 	// disconnected.
-	view = NewUtxoViewpoint()
+	view = NewUtxoViewpoint() //重新定义了一个UtxoViewpoint对象
 	view.SetBestHash(&b.bestChain.Tip().hash)
 
 	// Disconnect blocks from the main chain.
+	// 首先将待移除的区块从链尾向前逐个从主链上移除
 	for i, e := 0, detachNodes.Front(); e != nil; i, e = i+1, e.Next() {
 		n := e.Value.(*blockNode)
 		block := detachBlocks[i]
@@ -1044,6 +1092,7 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 		}
 
 		// Update the database and chain state.
+		// 调用disconnectBlock()将区块从主链移除，值得注意的是，区块并没有从区块文件中删除，只是将其Meta从数据库从删除
 		err = b.disconnectBlock(n, block, view)
 		if err != nil {
 			return err
@@ -1051,13 +1100,14 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 	}
 
 	// Connect the new best chain blocks.
+	// 区块移除完成后，接着开始将原侧链上的区块逐个添加到主链
 	for i, e := 0, attachNodes.Front(); e != nil; i, e = i+1, e.Next() {
 		n := e.Value.(*blockNode)
 		block := attachBlocks[i]
 
 		// Load all of the utxos referenced by the block that aren't
 		// already in the view.
-		err := view.fetchInputUtxos(b.db, block)
+		err := view.fetchInputUtxos(b.db, block) //从数据库中将区块花费的utxo加载进UtxoViewpoint中
 		if err != nil {
 			return err
 		}
@@ -1067,13 +1117,13 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 		// to it.  Also, provide an stxo slice so the spent txout
 		// details are generated.
 		stxos := make([]SpentTxOut, 0, countSpentOutputs(block))
-		err = view.connectTransactions(block, &stxos)
+		err = view.connectTransactions(block, &stxos) //调用UtxoViewpoint的connectTransactions()将区块花费的utxo设为已花费并记录区块花费的所有spentTxOut
 		if err != nil {
 			return err
 		}
 
 		// Update the database and chain state.
-		err = b.connectBlock(n, block, view, stxos)
+		err = b.connectBlock(n, block, view, stxos) //调用connectBlock()将区块写入主链，更新相关Meta到数据库
 		if err != nil {
 			return err
 		}
@@ -1107,6 +1157,9 @@ func (b *BlockChain) reorganizeChain(detachNodes, attachNodes *list.List) error 
 //    This is useful when using checkpoints.
 //
 // This function MUST be called with the chain state lock held (for writes).
+// 将区块写入区块链
+// 输入参数：待加入区块的blockNode对象、btcutil.Block辅助对象
+// 返回值：第一个返回值指明是否添加到主链
 func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, flags BehaviorFlags) (bool, error) {
 	fastAdd := flags&BFFastAdd == BFFastAdd
 
@@ -1124,6 +1177,8 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 	// We are extending the main (best) chain with a new block.  This is the
 	// most common case.
 	parentHash := &block.MsgBlock().Header.PrevBlock
+
+	//如果父区块的Hash就是主链是“尾”区块的Hash，则区块将被写入主链，并返回
 	if parentHash.IsEqual(&b.bestChain.Tip().hash) {
 		// Skip checks if node has already been fully validated.
 		fastAdd = fastAdd || b.index.NodeStatus(node).KnownValid()
@@ -1131,11 +1186,17 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 		// Perform several checks to verify the block can be connected
 		// to the main chain without violating any rules and without
 		// actually connecting the block.
-		view := NewUtxoViewpoint()
-		view.SetBestHash(parentHash)
+		// UtxoViewpoint表示区块链上从创世区块到观察点之间所有包含UTXO的交易及其中的UTXO(s)的集合，值得注意的是，
+		// UtxoViewpoint不仅仅记录了UTXO(s)，而且记录所有包含未花费输出的交易，它将用来验证重复交易、双重支付等，
+		// 它记录的utxoset是保证各节点上区块链一致性的重要对象
+		view := NewUtxoViewpoint()   //创建一个UtxoViewpoint对象
+		view.SetBestHash(parentHash) //将view的观察点设为主链的链尾
+
+		// countSpentOutputs()计算区块内所有交易花费的交易输出的个数，即所有交易的总的输入个数，并创建一个容量为相应大小的spentTxOut slice
 		stxos := make([]SpentTxOut, 0, countSpentOutputs(block))
+
 		if !fastAdd {
-			err := b.checkConnectBlock(node, block, view, &stxos)
+			err := b.checkConnectBlock(node, block, view, &stxos) //调用checkConnectBlock()对区块内的交易作验证，并更新utxoset
 			if err == nil {
 				b.index.SetStatusFlags(node, statusValid)
 			} else if _, ok := err.(RuleError); ok {
@@ -1167,6 +1228,7 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 		}
 
 		// Connect the block to the main chain.
+		// 调用connectBlock()将区块相关的信息写入数据库，真正实现将区块写入主链
 		err := b.connectBlock(node, block, view, stxos)
 		if err != nil {
 			// If we got hit with a rule error, then we'll mark
@@ -1194,12 +1256,12 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 		return true, nil
 	}
 	if fastAdd {
-		log.Warnf("fastAdd set in the side chain case? %v\n",
-			block.Hash())
+		log.Warnf("fastAdd set in the side chain case? %v\n", block.Hash())
 	}
 
 	// We're extending (or creating) a side chain, but the cumulative
 	// work for this new side chain is not enough to make it the new chain.
+	// 如果侧链的工作量之和小于主链的工作量之和，则直接返回
 	if node.workSum.Cmp(b.bestChain.Tip().workSum) <= 0 {
 		// Log information about how the block is forking the chain.
 		fork := b.bestChain.FindFork(node)
@@ -1223,9 +1285,12 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 	// blocks that form the (now) old fork from the main chain, and attach
 	// the blocks that form the new chain to the main chain starting at the
 	// common ancenstor (the point where the chain forked).
+	// 如果侧链的工作量之和大于主链的工作量之和，则需要将侧链调整为主链。
+	// 首先，调用getReorganizeNodes()找到分叉点以及侧链和主链上的区块节点
 	detachNodes, attachNodes := b.getReorganizeNodes(node)
 
 	// Reorganize the chain.
+	// 调用reorganizeChain()实现侧链变主链
 	log.Infof("REORGANIZE: Block %v is causing a reorganize.", node.hash)
 	err := b.reorganizeChain(detachNodes, attachNodes)
 

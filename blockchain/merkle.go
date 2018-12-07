@@ -45,6 +45,16 @@ var (
 // nextPowerOfTwo returns the next highest power of two from a given number if
 // it is not already a power of two.  This is a helper function used during the
 // calculation of a merkle tree.
+// 把n转换为2的指数值，例如：
+// (1) n=1, 2^0, 函数返回：1
+// (2) n=2, 2^1, 函数返回：2
+// (3) n=3, 2^1<n<2^2，函数返回：4
+// (4) n=4, 2^2，函数返回：4
+// (5) n=5, 2^2<n<2^3，函数返回：8
+// (6) n=6, 2^2<n<2^3，函数返回：8
+// (7) n=7, 2^2<n<2^3，函数返回：8
+// (8) n=8, 2^3，函数返回：8
+// (9) 如果n小于等于0，函数返回：0
 func nextPowerOfTwo(n int) int {
 	// Return the number if it's already a power of 2.
 	if n&(n-1) == 0 {
@@ -102,12 +112,27 @@ func HashMerkleBranches(left *chainhash.Hash, right *chainhash.Hash) *chainhash.
 // using witness transaction id's rather than regular transaction id's. This
 // also presents an additional case wherein the wtxid of the coinbase transaction
 // is the zeroHash.
+// BuildMerkleTreeStore()返回的是一个slice，而不是一个树结构，即它将Merkle树存在一个线性的数组结构中。
+// 由于采用线性数组来存树结构，为了便于索引每个节点，这里将Merkle树扩展为一颗完全平衡二叉树，
+// 平衡二叉树：叶子节点数=2^n，节点总个数2*2^n - 1
+// 如图中N=5的情形所示，最右侧为nil的节点即为扩充的节点。也就是说，叶子节点的个数会被扩充为大于或者等于当前叶子节点数的最小的2的幂，如N=5时，
+// 叶子节点个数扩充为8，扩充的节点值为nil，两个nil节点的父节点仍然是nil，所以并不影响最后树根的值。
 func BuildMerkleTreeStore(transactions []*btcutil.Tx, witness bool) []*chainhash.Hash {
 	// Calculate how many entries are required to hold the binary merkle
 	// tree as a linear array and create an array of that size.
-	nextPoT := nextPowerOfTwo(len(transactions))
-	arraySize := nextPoT*2 - 1
-	merkles := make([]*chainhash.Hash, arraySize)
+	// 把n转换为2的指数值，例如：
+	// (1) n=1, 2^0, 函数返回：1
+	// (2) n=2, 2^1, 函数返回：2
+	// (3) n=3, 2^1<n<2^2，函数返回：4
+	// (4) n=4, 2^2，函数返回：4
+	// (5) n=5, 2^2<n<2^3，函数返回：8
+	// (6) n=6, 2^2<n<2^3，函数返回：8
+	// (7) n=7, 2^2<n<2^3，函数返回：8
+	// (8) n=8, 2^3，函数返回：8
+	// 根据交易个数，即叶子节点个数，计算该值的最小2的幂
+	nextPoT := nextPowerOfTwo(len(transactions))  //平衡二叉树叶子节点个数
+	arraySize := nextPoT*2 - 1                    //平衡二叉树总节点个数
+	merkles := make([]*chainhash.Hash, arraySize) //初始化merkle树
 
 	// Create the base transaction hashes and populate the array with them.
 	for i, tx := range transactions {
@@ -123,13 +148,14 @@ func BuildMerkleTreeStore(transactions []*btcutil.Tx, witness bool) []*chainhash
 			wSha := tx.MsgTx().WitnessHash()
 			merkles[i] = &wSha
 		default:
-			merkles[i] = tx.Hash()
+			merkles[i] = tx.Hash() //把交易hash的指针填充到merkle树数组中
 		}
 
 	}
 
 	// Start the array offset after the last transaction and adjusted to the
 	// next power of two.
+	// 根据叶子节点构建完整的merkle树
 	offset := nextPoT
 	for i := 0; i < arraySize-1; i += 2 {
 		switch {

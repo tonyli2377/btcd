@@ -258,9 +258,14 @@ var MainNetParams = Params{
 	SubsidyReductionInterval: 210000,
 	TargetTimespan:           time.Hour * 24 * 14, // 14 days
 	TargetTimePerBlock:       time.Minute * 10,    // 10 minutes
-	RetargetAdjustmentFactor: 4,                   // 25% less, 400% more
-	ReduceMinDifficulty:      false,
-	MinDiffReductionTime:     0,
+
+	// RetargetAdjustmentFactor的值用于控制难度调整，控制在原值的1/4和原值的4倍之间
+	// minRetargetTimespa = targetTimespan / adjustmentFactor
+	// maxRetargetTimespan = targetTimespan * adjustmentFactor
+	RetargetAdjustmentFactor: 4, // 25% less, 400% more
+
+	ReduceMinDifficulty:  false,
+	MinDiffReductionTime: 0,
 	//LL,
 	//GenerateSupported:        false,
 	GenerateSupported: true,
