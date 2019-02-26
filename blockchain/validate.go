@@ -472,20 +472,17 @@ func checkBlockHeaderSanity(header *wire.BlockHeader, powLimit *big.Int, timeSou
 
 	// Ensure the block time is not too far in the future.
 	// 检查区块头中时间戳是否超过当前时间2小时，请注意，这里的“当前”时间并不是节点上的时钟，而是经过与Peer同步并较正过的时间
-	maxTimestamp := timeSource.AdjustedTime().Add(time.Second *
-		MaxTimeOffsetSeconds)
+	maxTimestamp := timeSource.AdjustedTime().Add(time.Second * MaxTimeOffsetSeconds)
 	if header.Timestamp.After(maxTimestamp) {
 		str := fmt.Sprintf("block timestamp of %v is too far in the "+
 			"future", header.Timestamp)
 		return ruleError(ErrTimeTooNew, str)
 	}
-
 	return nil
 }
 
 // checkBlockSanity performs some preliminary checks on a block to ensure it is
 // sane before continuing with block processing.  These checks are context free.
-//
 // The flags do not modify the behavior of this function directly, however they
 // are needed to pass along to checkBlockHeaderSanity.
 // 对区块结构进行完整性检查，保证在进一步验证之前区块本身是正确的

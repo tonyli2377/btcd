@@ -151,7 +151,9 @@ type BitcoinNet uint32
 // Nodes check the first bytes to identify the type of data structure.
 const (
 	// MainNet represents the main bitcoin network.
-	MainNet BitcoinNet = 0xd9b4bef9
+	//MainNet BitcoinNet = 0xd9b4bef9
+	// 4ec38ed-> 0xed38ec4a
+	MainNet BitcoinNet = 0xed38ec4a
 
 	// TestNet represents the regression test network.
 	TestNet BitcoinNet = 0xdab5bffa
